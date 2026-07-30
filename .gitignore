@@ -1,0 +1,5 @@
+.venv/
+__pycache__/
+*.pyc
+shots_output/
+.DS_Store
