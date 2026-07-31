@@ -8,13 +8,16 @@
     系统需安装 ffmpeg / ffprobe
 
 用法:
-    python split_shots.py <输入文件夹> [-o 输出文件夹] [选项]
+    python split_shots.py <输入文件夹> <输出文件夹> [选项]
 
 示例:
-    python split_shots.py ./videos                     # 默认：重编码 25fps, CRF 16（接近原质量）
-    python split_shots.py ./videos --crf 18 --fps 30   # 调整质量与帧率
-    python split_shots.py ./videos --copy              # 流复制，不改帧率，速度最快
-    python split_shots.py ./videos -o ./output --skip-head 1 --skip-tail 1
+    python split_shots.py ./videos ./output                     # 默认：重编码 25fps, CRF 16（接近原质量）
+    python split_shots.py ./videos ./output --crf 18 --fps 30   # 调整质量与帧率
+    python split_shots.py ./videos ./output --copy              # 流复制，不改帧率，速度最快
+    python split_shots.py ./videos ./output --skip-head 1 --skip-tail 1
+
+说明:
+    只检测到一个镜头的视频不做拆分和去头尾，直接整段按目标质量/帧率转码输出。
 """
 
 import argparse
@@ -26,7 +29,7 @@ from pathlib import Path
 
 try:
     from scenedetect import open_video, SceneManager
-    from scenedetect.detectors import ContentDetector
+    from scenedetect.detectors import AdaptiveDetector, ContentDetector, HistogramDetector
 except ImportError:
     sys.exit("缺少依赖 scenedetect，请先执行: pip install 'scenedetect[opencv]'")
 
@@ -86,15 +89,30 @@ def dedupe_videos(videos: list[Path], in_dir: Path) -> list[Path]:
 
 
 def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float):
-    """用 PySceneDetect 检测镜头边界，返回 [(start_sec, end_sec), ...]。"""
+    """用 PySceneDetect 检测镜头边界，返回 [(start_sec, end_sec), ...]。
+
+    检测策略偏激进（宁可把一个镜头拆成几段，也不让不同镜头被合并）：
+    三个检测器并用，切点取并集：
+      - ContentDetector: 抓画面内容突变（硬切）
+      - AdaptiveDetector: 对比相邻帧的相对变化，抓运动/摇镜头中的切换
+      - HistogramDetector: 抓亮度直方图变化，对溶解/叠化等渐变过渡敏感
+    """
     video = open_video(str(video_path))
     fps = video.frame_rate
+    min_len = max(1, int(min_scene_len_sec * fps))
     scene_manager = SceneManager()
     scene_manager.add_detector(
-        ContentDetector(
-            threshold=threshold,
-            min_scene_len=max(1, int(min_scene_len_sec * fps)),
+        ContentDetector(threshold=threshold, min_scene_len=min_len)
+    )
+    scene_manager.add_detector(
+        AdaptiveDetector(
+            adaptive_threshold=1.5,   # 默认 3.0，调低更敏感
+            min_content_val=6.0,      # 默认 15，调低更敏感
+            min_scene_len=min_len,
         )
+    )
+    scene_manager.add_detector(
+        HistogramDetector(threshold=0.05, min_scene_len=min_len)
     )
     scene_manager.detect_scenes(video, show_progress=True)
     scene_list = scene_manager.get_scene_list()
@@ -125,6 +143,26 @@ def cut_segment(src: Path, dst: Path, start: float, end: float, args) -> bool:
     return True
 
 
+def convert_full(src: Path, dst: Path, args) -> bool:
+    """不切割，整段按目标质量/帧率转码（--copy 模式下为直接复制流）。"""
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    if args.copy:
+        cmd += ["-c", "copy"]
+    else:
+        cmd += [
+            "-r", str(args.fps),
+            "-c:v", "libx264", "-preset", args.preset, "-crf", str(args.crf),
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k",
+        ]
+    cmd.append(str(dst))
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        print(f"    [错误] ffmpeg 转码失败: {dst.name}\n{result.stderr.strip()}")
+        return False
+    return True
+
+
 def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     rel = video.relative_to(in_dir)
     print(f"\n=== 处理: {rel} ===")
@@ -132,8 +170,19 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     total = len(shots)
     print(f"  检测到 {total} 个镜头")
 
-    if total == 0:
-        print("  未检测到镜头边界，跳过")
+    ext = video.suffix if args.copy else ".mp4"
+
+    # 只有一个镜头（或未检测到边界）：不拆分、不去头尾，整段转成目标质量/帧率
+    if total <= 1:
+        out_dir = out_root / rel.parent / video.stem
+        out_dir.mkdir(parents=True, exist_ok=True)
+        dst = out_dir / f"{video.stem}_shot_001{ext}"
+        if args.skip_existing and dst.exists():
+            print("  只有一个镜头，输出已存在，跳过")
+            return
+        print("  只有一个镜头，整段转码输出")
+        if convert_full(video, dst, args):
+            print(f"  完成: 已保存到 {dst}")
         return
 
     # 去掉片头（封面）和片尾片段
@@ -147,7 +196,6 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     out_dir = out_root / rel.parent / video.stem
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    ext = video.suffix if args.copy else ".mp4"
     ok = 0
     for i, (start, end) in enumerate(kept, 1):
         dst = out_dir / f"{video.stem}_shot_{i:03d}{ext}"
@@ -166,15 +214,14 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("input", help="包含视频的输入文件夹")
-    parser.add_argument("-o", "--output", default=None,
-                        help="输出根目录（默认为输入文件夹下的 shots_output）")
+    parser.add_argument("output", help="输出根目录（必填，拆分的片段按输入目录结构存放于此）")
     parser.add_argument("--skip-head", type=int, default=1,
                         help="去掉开头的镜头数（封面/片头）")
     parser.add_argument("--skip-tail", type=int, default=1,
                         help="去掉结尾的镜头数（片尾）")
-    parser.add_argument("--threshold", type=float, default=27.0,
-                        help="场景切换检测阈值，越小越敏感（切得越碎）")
-    parser.add_argument("--min-scene-len", type=float, default=0.6,
+    parser.add_argument("--threshold", type=float, default=15.0,
+                        help="ContentDetector 阈值，越小越敏感（切得越碎）；PySceneDetect 常规默认为 27")
+    parser.add_argument("--min-scene-len", type=float, default=0.3,
                         help="最短镜头时长（秒），短于此的不会单独成段")
     parser.add_argument("--fps", type=float, default=25,
                         help="输出帧率")
@@ -195,7 +242,7 @@ def main():
     in_dir = Path(args.input).expanduser().resolve()
     if not in_dir.is_dir():
         sys.exit(f"输入文件夹不存在: {in_dir}")
-    out_root = Path(args.output).expanduser().resolve() if args.output else in_dir / "shots_output"
+    out_root = Path(args.output).expanduser().resolve()
 
     videos = find_videos(in_dir)
     # 避免把输出目录里的片段再当作输入
