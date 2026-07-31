@@ -88,35 +88,55 @@ def dedupe_videos(videos: list[Path], in_dir: Path) -> list[Path]:
     return sorted(kept)
 
 
-def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float):
+def merge_short_scenes(shots, min_len_sec: float):
+    """把短于 min_len_sec 的碎片段并入前一个镜头。
+    多个检测器在同一次过渡附近先后触发时会产生零点几秒的碎片，这里统一收拢。"""
+    merged = []
+    for start, end in shots:
+        if merged and (end - start) < min_len_sec:
+            merged[-1] = (merged[-1][0], end)
+        else:
+            merged.append((start, end))
+    # 开头若剩下一个过短的段（没有前段可并），并入下一段
+    if len(merged) >= 2 and (merged[0][1] - merged[0][0]) < min_len_sec:
+        merged[1] = (merged[0][0], merged[1][1])
+        merged.pop(0)
+    return merged
+
+
+def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
+                 aggressive: bool = False):
     """用 PySceneDetect 检测镜头边界，返回 [(start_sec, end_sec), ...]。
 
-    检测策略偏激进（宁可把一个镜头拆成几段，也不让不同镜头被合并）：
-    三个检测器并用，切点取并集：
+    三个检测器并用，切点取并集（防止不同镜头被合并成一个）：
       - ContentDetector: 抓画面内容突变（硬切）
       - AdaptiveDetector: 对比相邻帧的相对变化，抓运动/摇镜头中的切换
       - HistogramDetector: 抓亮度直方图变化，对溶解/叠化等渐变过渡敏感
+    aggressive=True 时各检测器灵敏度大幅调高（切得更碎，但几乎不漏切）。
     """
     video = open_video(str(video_path))
     fps = video.frame_rate
     min_len = max(1, int(min_scene_len_sec * fps))
+    if aggressive:
+        adaptive_kwargs = dict(adaptive_threshold=1.5, min_content_val=6.0)
+        hist_threshold = 0.05
+    else:
+        adaptive_kwargs = dict(adaptive_threshold=2.5, min_content_val=12.0)
+        hist_threshold = 0.08
     scene_manager = SceneManager()
     scene_manager.add_detector(
         ContentDetector(threshold=threshold, min_scene_len=min_len)
     )
     scene_manager.add_detector(
-        AdaptiveDetector(
-            adaptive_threshold=1.5,   # 默认 3.0，调低更敏感
-            min_content_val=6.0,      # 默认 15，调低更敏感
-            min_scene_len=min_len,
-        )
+        AdaptiveDetector(min_scene_len=min_len, **adaptive_kwargs)
     )
     scene_manager.add_detector(
-        HistogramDetector(threshold=0.05, min_scene_len=min_len)
+        HistogramDetector(threshold=hist_threshold, min_scene_len=min_len)
     )
     scene_manager.detect_scenes(video, show_progress=True)
     scene_list = scene_manager.get_scene_list()
-    return [(start.get_seconds(), end.get_seconds()) for start, end in scene_list]
+    shots = [(start.get_seconds(), end.get_seconds()) for start, end in scene_list]
+    return merge_short_scenes(shots, min_scene_len_sec)
 
 
 def cut_segment(src: Path, dst: Path, start: float, end: float, args) -> bool:
@@ -166,7 +186,7 @@ def convert_full(src: Path, dst: Path, args) -> bool:
 def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     rel = video.relative_to(in_dir)
     print(f"\n=== 处理: {rel} ===")
-    shots = detect_shots(video, args.threshold, args.min_scene_len)
+    shots = detect_shots(video, args.threshold, args.min_scene_len, args.aggressive)
     total = len(shots)
     print(f"  检测到 {total} 个镜头")
 
@@ -219,10 +239,12 @@ def main():
                         help="去掉开头的镜头数（封面/片头）")
     parser.add_argument("--skip-tail", type=int, default=1,
                         help="去掉结尾的镜头数（片尾）")
-    parser.add_argument("--threshold", type=float, default=15.0,
+    parser.add_argument("--threshold", type=float, default=24.0,
                         help="ContentDetector 阈值，越小越敏感（切得越碎）；PySceneDetect 常规默认为 27")
-    parser.add_argument("--min-scene-len", type=float, default=0.3,
-                        help="最短镜头时长（秒），短于此的不会单独成段")
+    parser.add_argument("--min-scene-len", type=float, default=0.6,
+                        help="最短镜头时长（秒），短于此的段会并入相邻镜头")
+    parser.add_argument("--aggressive", action="store_true",
+                        help="激进检测模式：各检测器灵敏度大幅调高，几乎不漏切但切得更碎")
     parser.add_argument("--fps", type=float, default=25,
                         help="输出帧率")
     parser.add_argument("--crf", type=int, default=16,
