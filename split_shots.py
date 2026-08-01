@@ -24,6 +24,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -419,35 +420,50 @@ def write_scene_json(out_dir: Path, video: Path, shots, outputs, args) -> None:
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+# 结果记录文件名：scene.json 为本工具所写，scenes.json 兼容其它工具生成的结果
+SCENE_JSON_NAMES = ("scene.json", "scenes.json")
+
+
+def normalize_name(name: str) -> str:
+    """把文件名/目录名归一化，只保留字母数字并转小写。
+    用于跨命名风格匹配，例如 "片名 [68a81ec1f07ce].mp4" 与目录 "片名__68a81ec1f07ce"。"""
+    return re.sub(r"[^0-9a-zA-Z]+", "", Path(name).stem).lower()
+
+
 def load_processed_index(dirs) -> dict:
-    """扫描一个或多个结果目录中的 scene.json，建立"已处理视频"索引。
-    scene.json 只在片段导出完成后写入，因此它的存在即代表该视频已处理完毕。"""
+    """扫描一个或多个结果目录中的 scene.json / scenes.json，建立"已处理视频"索引。
+    该文件只在视频分析完成后写入，因此它的存在即代表该视频已处理完毕。"""
     index = {"paths": set(), "fingerprints": set(), "name_size": set(),
-             "names": set(), "count": 0}
+             "names": set(), "norms": set(), "count": 0}
     for d in dirs:
         root = Path(d).expanduser().resolve()
         if not root.is_dir():
             print(f"  [警告] 结果目录不存在，已忽略: {root}")
             continue
         found = 0
-        for sj in root.rglob("scene.json"):
-            try:
-                data = json.loads(sj.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                print(f"  [警告] 无法解析，已忽略: {sj}")
-                continue
-            src = data.get("source_video")
-            if not src:
-                continue
-            name = Path(src).name
-            index["paths"].add(str(Path(src)))
-            index["names"].add(name)
-            if data.get("source_fingerprint"):
-                index["fingerprints"].add(data["source_fingerprint"])
-            if data.get("source_size"):
-                index["name_size"].add((name, int(data["source_size"])))
-            index["count"] += 1
-            found += 1
+        for filename in SCENE_JSON_NAMES:
+            for sj in root.rglob(filename):
+                try:
+                    data = json.loads(sj.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    print(f"  [警告] 无法解析，已忽略: {sj}")
+                    continue
+                src = data.get("source_video")
+                if not src:
+                    continue
+                name = Path(src).name
+                index["paths"].add(str(Path(src)))
+                index["names"].add(name)
+                # 源文件名和所在目录名都纳入归一化索引：
+                # 其它工具常把视频名净化后作为目录名，两者归一化后应当一致
+                index["norms"].add(normalize_name(name))
+                index["norms"].add(normalize_name(sj.parent.name))
+                if data.get("source_fingerprint"):
+                    index["fingerprints"].add(data["source_fingerprint"])
+                if data.get("source_size"):
+                    index["name_size"].add((name, int(data["source_size"])))
+                index["count"] += 1
+                found += 1
         print(f"  {root}: {found} 条已处理记录")
     return index
 
@@ -463,8 +479,11 @@ def match_processed(video: Path, index: dict, match_by_name: bool):
                 return "文件名+大小匹配"
         except OSError:
             pass
-    if match_by_name and video.name in index["names"]:
-        return "文件名匹配"
+    if match_by_name:
+        if video.name in index["names"]:
+            return "文件名匹配"
+        if normalize_name(video.name) in index["norms"]:
+            return "归一化名称匹配"
     if index["fingerprints"] and file_fingerprint(video) in index["fingerprints"]:
         return "内容指纹匹配"
     return None
@@ -706,7 +725,8 @@ def main():
     parser.add_argument("--processed-dir", nargs="+", metavar="DIR",
                         help="额外扫描这些历史结果目录（可指定多个），隐含开启 --skip-processed")
     parser.add_argument("--match-by-name", action="store_true",
-                        help="已处理判定放宽到仅文件名匹配（默认用路径、文件名+大小、内容指纹匹配）")
+                        help="已处理判定放宽到按文件名匹配（含归一化名称，可跨命名风格）；"
+                             "默认只用路径、文件名+大小、内容指纹匹配")
     parser.add_argument("--scan-only", action="store_true",
                         help="只扫描并报告哪些视频已处理/待处理，不做任何转码")
     parser.add_argument("--no-dedup", action="store_true",
