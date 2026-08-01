@@ -5,6 +5,19 @@
 
 主要用于视频数据集的批量预处理。
 
+## 目录
+
+- [功能](#功能)
+- [安装](#安装)
+- [快速开始](#快速开始)
+- [典型使用流程](#典型使用流程)
+- [输出结构](#输出结构)
+- [参数说明](#参数说明)
+- [后台运行](#后台运行)
+- [性能与资源占用](#性能与资源占用)
+- [调参建议](#调参建议)
+- [常见问题](#常见问题)
+
 ## 功能
 
 - **递归扫描**：遍历所有子目录，识别 mp4 / mkv / avi / mov / flv / wmv / webm / ts / rmvb 等 20 种常见格式
@@ -46,27 +59,95 @@ ffmpeg 手动安装：
 | macOS | `brew install ffmpeg` |
 | Windows | `winget install Gyan.FFmpeg` |
 
-## 使用
+## 快速开始
 
 ```bash
 python split_shots.py <输入文件夹> <输出文件夹> [选项]
 ```
 
-常用示例：
+两个位置参数都是必填的。最简单的一次完整运行：
 
 ```bash
-# 默认配置：25fps、CRF 16、最短片段 15 秒
-python split_shots.py ./videos ./output
+python split_shots.py ./videos /data/output --preset veryfast --crf 20
+```
 
-# 调整画质与帧率
-python split_shots.py ./videos ./output --crf 18 --fps 30
+它会递归扫描 `./videos` 下的所有视频，逐个检测镜头、去掉片头片尾、拆成片段，
+按原目录结构写入 `/data/output`，并为每个视频生成 `scene.json`。
 
-# 保留更短的片段，并放宽镜头检测（切得更粗）
-python split_shots.py ./videos ./output --min-clip 8 --threshold 27
+> 建议加上 `--preset veryfast --crf 20`：默认的 `slow`/CRF 16 是画质优先的重负载配置，
+> 批量处理时会占满 CPU 且输出体积很大，详见[性能与资源占用](#性能与资源占用)。
 
-# 后台运行，之后查看进度
-python split_shots.py ./videos ./output --background
-python split_shots.py ./videos ./output --status
+常用命令速查：
+
+| 目的 | 命令 |
+| --- | --- |
+| 标准批量处理 | `python split_shots.py ./videos /data/out --preset veryfast --crf 20` |
+| 只看会处理哪些视频 | `python split_shots.py ./videos /data/out --scan-only` |
+| 处理新增素材（跳过旧的） | `python split_shots.py ./videos /data/out --skip-processed` |
+| 快速粗切（不重编码） | `python split_shots.py ./videos /data/out --copy` |
+| 后台跑 + 查看进度 | `--background` / `--status` / `--stop` |
+
+## 典型使用流程
+
+### 首次批量处理
+
+先用 `--scan-only` 确认扫描到的视频数量符合预期，再正式跑：
+
+```bash
+# 1. 先看看会处理多少视频
+python split_shots.py ./videos /data/output --scan-only
+
+# 2. 拿一小批素材试参数，确认切分效果和画质
+python split_shots.py ./sample /data/test --preset veryfast --crf 20
+
+# 3. 确认无误后转后台跑全量
+python split_shots.py ./videos /data/output --preset veryfast --crf 20 --background
+
+# 4. 随时查看进度
+python split_shots.py ./videos /data/output --status
+```
+
+第 2 步很重要：不同来源的素材，合适的检测阈值和片段时长差别很大，
+先用小批量确认再跑全量能省下大量返工时间。参考[调参建议](#调参建议)。
+
+### 素材陆续新增（增量处理）
+
+素材库不断补充新视频时，加 `--skip-processed` 即可只处理新增部分，
+已处理过的视频连镜头检测都不会做：
+
+```bash
+python split_shots.py ./videos /data/output --skip-processed --preset veryfast --crf 20
+```
+
+如果历史结果分散在多个批次目录里，用 `--processed-dir` 一并纳入判断：
+
+```bash
+python split_shots.py ./videos /data/output_v3 \
+    --processed-dir /data/output_v1 /data/output_v2 \
+    --preset veryfast --crf 20
+```
+
+### 任务中断后继续
+
+任务被中断（手动停止、断电、报错）后，加 `--skip-existing` 重跑，已切好的片段不会重做：
+
+```bash
+python split_shots.py ./videos /data/output --skip-existing --preset veryfast --crf 20
+```
+
+已经完整处理完的视频，配合 `--skip-processed` 可以整个跳过，比 `--skip-existing` 更省时间：
+
+```bash
+python split_shots.py ./videos /data/output --skip-processed --skip-existing
+```
+
+### 只要粗切，不在乎精确切点
+
+`--copy` 直接复制视频流，不重编码，速度快几十倍且完全无损，
+代价是切点会对齐到关键帧（零点几秒偏差），且不会统一帧率：
+
+```bash
+python split_shots.py ./videos /data/output --copy
 ```
 
 ## 输出结构
@@ -302,6 +383,40 @@ python split_shots.py ./videos /data/output --preset veryfast --crf 20
 6. 去掉固定数量的首尾镜头，再自动去除残留的静态 logo / 定帧画面
 7. 丢弃短于 `--min-clip` 的片段
 8. 用 ffmpeg 导出片段，写入 `scene.json`
+
+## 常见问题
+
+**为什么某个视频的输出文件夹是空的，只有一个 `scene.json`？**
+
+说明该视频分析过了，但没有片段满足条件——通常是所有镜头都短于 `--min-clip`（默认 15 秒），
+或者去掉片头片尾后没有剩余镜头。打开 `scene.json` 看 `scenes` 里各段的 `duration` 即可确认。
+需要保留更短的片段就调小 `--min-clip`。
+
+**片段编号为什么不连续？**
+
+编号是**场景索引**，对应 `scene.json` 里的 `scene_index`。被去掉的片头、logo、过短片段
+占用了中间的索引，所以编号会跳号，这是正常的。
+
+**处理到一半报错了，重跑会重复做吗？**
+
+加 `--skip-existing` 就不会，已存在的片段文件会被跳过。已完整处理完的视频可以再加
+`--skip-processed` 整个跳过，连镜头检测都省了。
+
+**输出文件比原视频还大？**
+
+CRF 是按内容动态分配码率的，源视频码率很低时（比如网上下载的压缩视频），
+CRF 16 的输出确实可能更大。调大 `--crf`（如 20~23）即可。
+
+**能识别重新压制过的重复视频吗？**
+
+不能。去重和已处理判定都基于内容指纹，只能识别字节级相同的副本（复制、改名、移动过的文件）。
+同一视频被重新编码后指纹就变了。文件名没变的话可以用 `--match-by-name` 放宽判定。
+
+**Windows 上跑着跑着电脑卡死？**
+
+默认的 `--preset slow --crf 16` 会占满 CPU。改用 `--preset veryfast --crf 20`，
+输出目录指定到非系统盘。另外 `--stop` 目前不会杀掉 ffmpeg 子进程，
+停止任务后请在任务管理器确认没有残留的 `ffmpeg.exe`。详见[性能与资源占用](#性能与资源占用)。
 
 ## 依赖
 
