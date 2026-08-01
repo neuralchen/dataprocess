@@ -27,6 +27,8 @@
 - **片头片尾去除**：固定跳过首尾镜头，再自动识别并去掉残留的静态 logo、片名、结尾定帧画面
 - **最短片段过滤**：短于指定时长的片段直接丢弃，避免产生大量碎片
 - **质量与帧率控制**：统一输出帧率，CRF 控制画质；也支持无损流复制
+- **并行处理**：多视频并发处理，自动按 CPU 核心数分配任务数与编码线程
+- **GPU 硬件编码**：支持 NVIDIA NVENC（CUDA）和 macOS VideoToolbox，大幅降低 CPU 占用
 - **目录结构保留**：输出完整复刻输入的目录层级
 - **分段记录**：每个视频输出 `scene.json`，记录所有检测到的场景及导出路径
 - **后台运行**：一键转后台执行，支持查看进度与停止，Windows / Linux / macOS 通用
@@ -243,6 +245,37 @@ videos/                        output/
 | --- | --- | --- |
 | `--min-clip` | 15.0 | 输出片段的最短时长（秒），短于此的直接丢弃；单镜头视频总时长不足时整个跳过 |
 
+### 并行与硬件加速
+
+| 参数 | 默认值 | 说明 |
+| --- | --- | --- |
+| `-j` / `--jobs` | 0（自动） | 并行处理的视频数；自动值为 `核心数-2`，上限 16 |
+| `--threads` | 0（自动） | 单个 ffmpeg 的编码线程数；自动值为 `核心数 / jobs`，最小 2 |
+| `--encoder` | cpu | `cpu` / `nvenc` / `nvenc-hevc` / `videotoolbox` / `auto` |
+| `--cq` | 同 `--crf` | 硬件编码的质量值，越小质量越高 |
+
+**并行策略**：多进程少线程明显优于单进程多线程。x264 在片段较短时线程扩展性很差，
+而每个任务都有进程启动、seek、镜头检测等非满载阶段，因此 `jobs × threads` 略微超过
+核心数反而利用率更高。自动值已按实测调优，一般无需手动指定。
+
+**GPU 加速**：`--encoder nvenc` 使用 NVIDIA 显卡编码（需要 CUDA 驱动和带 NVENC 的 ffmpeg），
+同时启用 CUDA 硬件解码。`--encoder auto` 会自动检测可用的硬件编码器，检测方式是实际试跑一次编码，
+因此不会出现"编译了但驱动跑不通"的误判。
+
+```bash
+# 自动选择最快的可用编码器
+python split_shots.py ./videos /data/out --encoder auto
+
+# 显式使用 NVIDIA GPU，质量值 20
+python split_shots.py ./videos /data/out --encoder nvenc --cq 20
+
+# 手动指定并行度（长视频较少时可调低）
+python split_shots.py ./videos /data/out --jobs 4
+```
+
+> GPU 编码的画质与同数值的 x264 CRF 不完全等价，体积通常略大。
+> **同一批数据集建议固定用同一种编码器**，避免不同批次画质特征不一致。
+
 ### 编码质量
 
 | 参数 | 默认值 | 说明 |
@@ -325,9 +358,8 @@ python split_shots.py ./videos ./output --stop
 后台进程与终端分离，关闭终端不影响运行。PID 记录在输出目录的 `.split_shots.pid`，
 任务结束后自动清理。中途停止后，用 `--skip-existing` 重新运行即可从断点继续。
 
-> ⚠️ **已知问题**：`--stop` 目前只结束 Python 主进程，正在运行的 ffmpeg 子进程不会被一并杀掉，
-> 会成为占满 CPU 的孤儿进程。停止任务后请到任务管理器（Windows）或用 `pkill ffmpeg`（Linux / macOS）
-> 确认没有残留的 ffmpeg。
+> `--stop` 会连同全部工作进程和 ffmpeg 子进程一起结束（Windows 用 `taskkill /T`，
+> Linux / macOS 杀整个进程组），不会留下占满 CPU 的孤儿进程。
 >
 > 另外重复运行的保护是**按输出目录**判断的，换一个输出目录再启动不会被拦截。Windows 后台任务不显示窗口，
 > 启动新任务前建议先用 `--status` 确认上一批已经结束。
@@ -341,6 +373,23 @@ python split_shots.py ./videos ./output --stop
 | 镜头检测 | 约 157 MB 内存，速度很快，不是瓶颈 |
 | ffmpeg 编码（默认参数） | **占满约 8 个核心**，单进程峰值内存约 900 MB（4K 素材会达到 3~4 GB） |
 | 输出体积（CRF 16） | 与源文件相当甚至更大 |
+
+### 实测加速效果
+
+12 个 720p 视频、共 36 个片段、10 核 CPU、`--preset medium --crf 18`：
+
+| 配置 | 耗时 | CPU 占用 | 相对串行 |
+| --- | --- | --- | --- |
+| CPU 串行（`--jobs 1`） | 31.3 s | 6.6 核 | 1.00× |
+| CPU 并行（自动） | 26.0 s | 8.7 核 | **1.20×** |
+| GPU 硬件编码 | 16.7 s | **2.3 核** | **1.87×** |
+
+CPU 并行的收益有限，因为 x264 本身已经能吃满多核；核心数越多的服务器收益越明显。
+**GPU 编码才是数量级的差异**——不仅快近一倍，CPU 占用还从 8.7 核降到 2.3 核，
+机器仍可正常做别的事。有 NVIDIA 显卡的话强烈建议加 `--encoder nvenc`。
+
+内存方面注意：并行任务数越多内存占用越高。处理 4K 素材时单个 ffmpeg 就要 3~4 GB，
+`--jobs 16` 可能需要 50 GB 以上，此时应手动调低 `--jobs`。
 
 由此带来的三个实际风险：
 
@@ -369,8 +418,9 @@ python split_shots.py ./videos /data/output --preset veryfast --crf 20
 | 片头 logo 没去干净 | 调大 `--motion-threshold`（如 2~3），或调大 `--skip-head` |
 | 正片开头的静态空镜被误删 | 使用 `--no-auto-trim`，或调小 `--motion-threshold` |
 | 有效片段被丢弃太多 | 调小 `--min-clip` |
-| 处理速度太慢 | 使用 `--preset veryfast`，或用 `--copy` 跳过重编码 |
-| 电脑卡顿、界面无响应 | 改用 `--preset veryfast --crf 20`；确认没有残留的 ffmpeg 孤儿进程 |
+| 处理速度太慢 | 优先用 `--encoder nvenc`（有 N 卡时）；其次 `--preset veryfast`，或 `--copy` 跳过重编码 |
+| 电脑卡顿、界面无响应 | 用 `--encoder nvenc` 把编码交给 GPU；或调低 `--jobs` |
+| 内存不够 / OOM | 调低 `--jobs`（4K 素材建议 4 以下） |
 | 磁盘被写满 | 输出目录指定到非系统盘；调大 `--crf`（如 20~23）减小体积 |
 
 ## 处理流程
@@ -414,9 +464,9 @@ CRF 16 的输出确实可能更大。调大 `--crf`（如 20~23）即可。
 
 **Windows 上跑着跑着电脑卡死？**
 
-默认的 `--preset slow --crf 16` 会占满 CPU。改用 `--preset veryfast --crf 20`，
-输出目录指定到非系统盘。另外 `--stop` 目前不会杀掉 ffmpeg 子进程，
-停止任务后请在任务管理器确认没有残留的 `ffmpeg.exe`。详见[性能与资源占用](#性能与资源占用)。
+默认的 `--preset slow --crf 16` 会占满 CPU。有 NVIDIA 显卡就加 `--encoder nvenc` 把编码交给 GPU，
+CPU 占用可降到 1/4；没有的话改用 `--preset veryfast --crf 20` 并调低 `--jobs`。
+输出目录记得指定到非系统盘。详见[性能与资源占用](#性能与资源占用)。
 
 ## 依赖
 

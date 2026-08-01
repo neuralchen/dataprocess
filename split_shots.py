@@ -28,6 +28,7 @@ import signal
 import subprocess
 import sys
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -110,6 +111,137 @@ def merge_short_scenes(shots, min_len_sec: float):
     return merged
 
 
+class Log:
+    """收集单个视频的处理日志。并行模式下按视频整块输出，避免多进程输出交错。"""
+
+    def __init__(self):
+        self.lines, self._buf = [], ""
+
+    def add(self, text=""):
+        """写入完整的一行。"""
+        self.flush()
+        self.lines.append(text)
+
+    def part(self, text):
+        """续写当前行（用于分段拼接的进度描述）。"""
+        self._buf += text
+
+    def flush(self):
+        if self._buf:
+            self.lines.append(self._buf)
+            self._buf = ""
+
+    def text(self) -> str:
+        self.flush()
+        return "\n".join(self.lines)
+
+
+# ---------- 并行与硬件加速 ----------
+
+# --preset 到 NVENC preset 的映射（p1 最快、p7 最慢质量最好）
+NVENC_PRESET = {
+    "ultrafast": "p1", "superfast": "p1", "veryfast": "p2", "faster": "p3",
+    "fast": "p4", "medium": "p4", "slow": "p5", "slower": "p6", "veryslow": "p7",
+}
+
+
+def cpu_count() -> int:
+    return os.cpu_count() or 4
+
+
+# 编码器名称 -> 实际的 ffmpeg 编码器
+HW_CODEC = {
+    "nvenc": "h264_nvenc",
+    "nvenc-hevc": "hevc_nvenc",
+    "videotoolbox": "h264_videotoolbox",
+}
+
+
+def encoder_available(codec: str) -> bool:
+    """检测硬件编码器是否真正可用：既要 ffmpeg 编译了它，也要驱动/硬件能跑通。"""
+    try:
+        listed = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"],
+                                capture_output=True, text=True, timeout=30).stdout
+        if codec not in listed:
+            return False
+        probe = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error",
+             "-f", "lavfi", "-i", "color=black:s=256x256:d=0.1",
+             "-c:v", codec, "-f", "null", "-"],
+            capture_output=True, timeout=60)
+        return probe.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def resolve_encoder(args) -> str:
+    """把 --encoder auto 解析成实际使用的编码器。"""
+    if args.encoder == "auto":
+        for name in ("nvenc", "videotoolbox"):
+            if encoder_available(HW_CODEC[name]):
+                print(f"检测到可用的硬件编码器，启用 GPU 编码 ({HW_CODEC[name]})")
+                return name
+        print("未检测到可用的硬件编码器，使用 CPU 编码 (libx264)")
+        return "cpu"
+    if args.encoder != "cpu":
+        codec = HW_CODEC[args.encoder]
+        if not encoder_available(codec):
+            sys.exit(f"指定了 --encoder {args.encoder}，但 {codec} 不可用。"
+                     f"请确认显卡驱动和 ffmpeg 的硬件编码支持，或改用 --encoder cpu")
+    return args.encoder
+
+
+def resolve_parallel(args) -> tuple:
+    """确定并行任务数和每个 ffmpeg 的线程数。
+
+    实测表明：多进程少线程明显优于单进程多线程——x264 的线程扩展性在片段较短时很差，
+    而每个任务都有进程启动、seek、镜头检测等非满载阶段，因此 jobs × threads 略微
+    超过核心数反而利用率更高。
+    """
+    cores = cpu_count()
+    gpu = args.encoder.startswith("nvenc")
+    if args.jobs > 0:
+        jobs = args.jobs
+    elif gpu:
+        # GPU 编码时 CPU 只负责解码和检测；NVENC 并发会话数也有上限
+        jobs = max(1, min(cores // 2, 8))
+    else:
+        jobs = max(1, min(cores - 2, 16))
+    if args.threads > 0:
+        threads = args.threads
+    elif gpu:
+        threads = 0  # 解码线程交给 ffmpeg 自行决定
+    else:
+        threads = max(2, cores // jobs)
+    return jobs, threads
+
+
+def video_encode_args(args) -> list:
+    """按所选编码器生成 ffmpeg 的视频编码参数。"""
+    quality = args.cq if args.cq is not None else args.crf
+    if args.encoder == "cpu":
+        cmd = ["-c:v", "libx264", "-preset", args.preset, "-crf", str(args.crf),
+               "-pix_fmt", "yuv420p"]
+        if args.threads > 0:
+            cmd += ["-threads", str(args.threads)]
+        return cmd
+    if args.encoder == "videotoolbox":
+        # VideoToolbox 用 -q:v（1-100，越大质量越高），由 CRF 反向映射
+        q = max(1, min(100, int(100 - quality * 2.2)))
+        return ["-c:v", "h264_videotoolbox", "-q:v", str(q), "-pix_fmt", "yuv420p"]
+    return ["-c:v", HW_CODEC[args.encoder], "-preset", NVENC_PRESET.get(args.preset, "p4"),
+            "-rc", "vbr", "-cq", str(quality), "-b:v", "0", "-pix_fmt", "yuv420p"]
+
+
+def decode_accel_args(args) -> list:
+    """硬件解码加速（放在 -i 之前）。"""
+    if args.encoder.startswith("nvenc"):
+        return ["-hwaccel", "cuda"]
+    if args.encoder == "videotoolbox":
+        return ["-hwaccel", "videotoolbox"]
+    return []
+
+
 # ---------- 后台运行机制 ----------
 
 def pid_file_path(out_root: Path) -> Path:
@@ -181,8 +313,17 @@ def stop_background(out_root: Path) -> None:
     if not pid or not is_running(pid):
         print("没有正在运行的后台任务")
         return
-    os.kill(pid, signal.SIGTERM)
-    print(f"已停止后台任务 (PID {pid})。用 --skip-existing 重跑可从断点继续")
+    # 必须连同子进程一起杀：并行模式下有多个工作进程和 ffmpeg，
+    # 只杀主进程会留下占满 CPU 的孤儿 ffmpeg
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                       capture_output=True)
+    else:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)  # 后台任务是进程组组长
+        except OSError:
+            os.kill(pid, signal.SIGTERM)
+    print(f"已停止后台任务 (PID {pid}) 及其全部子进程。用 --skip-existing 重跑可从断点继续")
     pid_file_path(out_root).unlink(missing_ok=True)
 
 
@@ -349,7 +490,7 @@ def filter_processed(videos, in_dir: Path, scan_dirs, match_by_name: bool, verbo
 
 
 def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
-                 aggressive: bool = False):
+                 aggressive: bool = False, show_progress: bool = False):
     """用 PySceneDetect 检测镜头边界，返回 [(start_sec, end_sec), ...]。
 
     三个检测器并用，切点取并集（防止不同镜头被合并成一个）：
@@ -377,62 +518,63 @@ def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
     scene_manager.add_detector(
         HistogramDetector(threshold=hist_threshold, min_scene_len=min_len)
     )
-    scene_manager.detect_scenes(video, show_progress=sys.stderr.isatty())
+    scene_manager.detect_scenes(video, show_progress=show_progress)
     scene_list = scene_manager.get_scene_list()
     shots = [(start.get_seconds(), end.get_seconds()) for start, end in scene_list]
     return merge_short_scenes(shots, min_scene_len_sec)
 
 
-def cut_segment(src: Path, dst: Path, start: float, end: float, args) -> bool:
+def cut_segment(src: Path, dst: Path, start: float, end: float, args, log: Log) -> bool:
     """用 ffmpeg 切出 [start, end) 片段。返回是否成功。"""
     duration = end - start
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-           "-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}"]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    if not args.copy:
+        cmd += decode_accel_args(args)
+    cmd += ["-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}"]
     if args.copy:
         # 流复制：速度快，不改帧率，切点会对齐到关键帧，可能有少许偏差
         cmd += ["-c", "copy"]
     else:
-        # 重编码：切点精确到帧，统一输出帧率，CRF 控制质量
-        cmd += [
-            "-r", str(args.fps),
-            "-c:v", "libx264", "-preset", args.preset, "-crf", str(args.crf),
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-        ]
+        # 重编码：切点精确到帧，统一输出帧率
+        cmd += ["-r", str(args.fps)] + video_encode_args(args) + \
+               ["-c:a", "aac", "-b:a", "192k"]
     cmd += ["-avoid_negative_ts", "make_zero", str(dst)]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"    [错误] ffmpeg 切割失败: {dst.name}\n{result.stderr.strip()}")
+        log.add(f"    [错误] ffmpeg 切割失败: {dst.name}\n{result.stderr.strip()}")
         return False
     return True
 
 
-def convert_full(src: Path, dst: Path, args) -> bool:
+def convert_full(src: Path, dst: Path, args, log: Log) -> bool:
     """不切割，整段按目标质量/帧率转码（--copy 模式下为直接复制流）。"""
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src)]
+    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+    if not args.copy:
+        cmd += decode_accel_args(args)
+    cmd += ["-i", str(src)]
     if args.copy:
         cmd += ["-c", "copy"]
     else:
-        cmd += [
-            "-r", str(args.fps),
-            "-c:v", "libx264", "-preset", args.preset, "-crf", str(args.crf),
-            "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-b:a", "192k",
-        ]
+        cmd += ["-r", str(args.fps)] + video_encode_args(args) + \
+               ["-c:a", "aac", "-b:a", "192k"]
     cmd.append(str(dst))
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
-        print(f"    [错误] ffmpeg 转码失败: {dst.name}\n{result.stderr.strip()}")
+        log.add(f"    [错误] ffmpeg 转码失败: {dst.name}\n{result.stderr.strip()}")
         return False
     return True
 
 
-def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
+def process_video(video: Path, in_dir: Path, out_root: Path, args) -> str:
+    """处理单个视频，返回该视频的完整日志文本（供并行调度按块输出）。"""
+    log = Log()
     rel = video.relative_to(in_dir)
-    print(f"=== 处理: {rel} ===")
-    shots = detect_shots(video, args.threshold, args.min_scene_len, args.aggressive)
+    log.add(f"=== 处理: {rel} ===")
+    show_progress = args.jobs == 1 and sys.stderr.isatty()
+    shots = detect_shots(video, args.threshold, args.min_scene_len,
+                         args.aggressive, show_progress)
     total = len(shots)
-    print(f"  检测到 {total} 个镜头")
+    log.add(f"  检测到 {total} 个镜头")
 
     ext = video.suffix if args.copy else ".mp4"
 
@@ -442,22 +584,22 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
         out_dir = out_root / rel.parent / video.stem
         out_dir.mkdir(parents=True, exist_ok=True)
         if duration < args.min_clip:
-            print(f"  只有一个镜头且时长 {duration:.1f}s 不足 {args.min_clip:g}s，跳过")
+            log.add(f"  只有一个镜头且时长 {duration:.1f}s 不足 {args.min_clip:g}s，跳过")
             write_scene_json(out_dir, video, [(0.0, duration)], {}, args)
-            return
+            return log.text()
         dst = out_dir / f"{video.stem}_scene_0000{ext}"
         whole = [(0.0, duration)]
         if args.skip_existing and dst.exists():
-            print("  只有一个镜头，输出已存在，跳过")
+            log.add("  只有一个镜头，输出已存在，跳过")
             write_scene_json(out_dir, video, whole, {0: dst}, args)
-            return
-        print("  只有一个镜头，整段转码输出")
-        if convert_full(video, dst, args):
-            print(f"  完成: 已保存到 {dst}")
+            return log.text()
+        log.add("  只有一个镜头，整段转码输出")
+        if convert_full(video, dst, args, log):
+            log.add(f"  完成: 已保存到 {dst}")
             write_scene_json(out_dir, video, whole, {0: dst}, args)
         else:
             write_scene_json(out_dir, video, whole, {}, args)
-        return
+        return log.text()
 
     # 维持输入文件夹的路径结构，再按原视频名建立输出文件夹
     out_dir = out_root / rel.parent / video.stem
@@ -466,27 +608,27 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     # 去掉片头（封面）和片尾片段（基于场景索引操作，便于在 scene.json 中溯源）
     kept_idx = list(range(total))[args.skip_head: total - args.skip_tail if args.skip_tail else None]
     if not kept_idx:
-        print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个后没有剩余片段，跳过")
+        log.add(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个后没有剩余片段，跳过")
         write_scene_json(out_dir, video, shots, {}, args)
-        return
-    print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个", end="")
+        return log.text()
+    log.part(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个")
 
     # 自动去除残留的静态 logo/片名/定帧镜头
     if not args.no_auto_trim:
         kept_idx, head_n, tail_n = auto_trim_static(
             video, shots, kept_idx, args.motion_threshold, args.trim_window)
         if head_n or tail_n:
-            print(f"，再自动去除静态镜头（片头 {head_n} 个、片尾 {tail_n} 个）", end="")
+            log.part(f"，再自动去除静态镜头（片头 {head_n} 个、片尾 {tail_n} 个）")
 
     # 丢弃过短的片段
     long_enough = [i for i in kept_idx if shots[i][1] - shots[i][0] >= args.min_clip]
     if len(long_enough) < len(kept_idx):
-        print(f"，丢弃短于 {args.min_clip:g}s 的片段 {len(kept_idx) - len(long_enough)} 个", end="")
+        log.part(f"，丢弃短于 {args.min_clip:g}s 的片段 {len(kept_idx) - len(long_enough)} 个")
     kept_idx = long_enough
-    print(f"，保留 {len(kept_idx)} 个片段")
+    log.add(f"，保留 {len(kept_idx)} 个片段")
     if not kept_idx:
         write_scene_json(out_dir, video, shots, {}, args)
-        return
+        return log.text()
 
     ok = 0
     outputs = {}
@@ -497,12 +639,13 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
             outputs[idx] = dst
             ok += 1
             continue
-        if cut_segment(video, dst, start, end, args):
+        if cut_segment(video, dst, start, end, args, log):
             outputs[idx] = dst
             ok += 1
-            print(f"    [{n}/{len(kept_idx)}] {dst.name}  ({start:.2f}s - {end:.2f}s)")
+            log.add(f"    [{n}/{len(kept_idx)}] {dst.name}  ({start:.2f}s - {end:.2f}s)")
     write_scene_json(out_dir, video, shots, outputs, args)
-    print(f"  完成: {ok}/{len(kept_idx)} 个片段已保存到 {out_dir}，场景记录已写入 scene.json")
+    log.add(f"  完成: {ok}/{len(kept_idx)} 个片段已保存到 {out_dir}，场景记录已写入 scene.json")
+    return log.text()
 
 
 def main():
@@ -537,6 +680,17 @@ def main():
                         help="查看后台任务状态和最新日志")
     parser.add_argument("--stop", action="store_true",
                         help="停止正在运行的后台任务")
+    parser.add_argument("-j", "--jobs", type=int, default=0,
+                        help="并行处理的视频数，0 为自动（按 CPU 核心数推算）")
+    parser.add_argument("--threads", type=int, default=0,
+                        help="单个 ffmpeg 的编码线程数，0 为自动（使 总线程数≈核心数-2）")
+    parser.add_argument("--encoder", default="cpu",
+                        choices=["cpu", "nvenc", "nvenc-hevc", "videotoolbox", "auto"],
+                        help="编码器：cpu=libx264；nvenc=NVIDIA GPU H.264；"
+                             "nvenc-hevc=NVIDIA GPU H.265；videotoolbox=macOS 硬件编码；"
+                             "auto=有硬件编码器就用")
+    parser.add_argument("--cq", type=int, default=None,
+                        help="硬件编码的质量值（越小质量越高），默认沿用 --crf 的取值")
     parser.add_argument("--fps", type=float, default=25,
                         help="输出帧率")
     parser.add_argument("--crf", type=int, default=16,
@@ -608,18 +762,41 @@ def main():
     if not args.no_dedup:
         print("正在扫描重复视频 ...")
         videos = dedupe_videos(videos, in_dir)
-    print(f"待处理 {len(videos)} 个视频，输出目录: {out_root}")
+
+    # 解析编码器与并行度（写回 args，供各工作进程使用）
+    args.encoder = resolve_encoder(args)
+    args.jobs, args.threads = resolve_parallel(args)
+    mode = f"GPU ({HW_CODEC[args.encoder]})" if args.encoder != "cpu" else "CPU (libx264)"
+    detail = f"{args.jobs} 个并行任务"
+    if args.encoder == "cpu":
+        detail += f" × 每个 {args.threads} 线程"
+    print(f"待处理 {len(videos)} 个视频，编码方式: {mode}，{detail}")
+    print(f"输出目录: {out_root}")
 
     out_root.mkdir(parents=True, exist_ok=True)
     pid_file_path(out_root).write_text(str(os.getpid()))
+    total = len(videos)
     try:
-        for i, v in enumerate(videos, 1):
-            try:
-                print(f"\n[{i}/{len(videos)}] ", end="")
-                process_video(v, in_dir, out_root, args)
-            except Exception as e:
-                print(f"  [错误] 处理 {v.name} 失败: {e}")
+        if args.jobs == 1:
+            for i, v in enumerate(videos, 1):
+                print(f"\n[{i}/{total}] ", end="")
+                try:
+                    print(process_video(v, in_dir, out_root, args))
+                except Exception as e:
+                    print(f"  [错误] 处理 {v.name} 失败: {e}")
+        else:
+            with ProcessPoolExecutor(max_workers=args.jobs) as pool:
+                futures = {pool.submit(process_video, v, in_dir, out_root, args): v
+                           for v in videos}
+                for i, fut in enumerate(as_completed(futures), 1):
+                    v = futures[fut]
+                    try:
+                        print(f"\n[{i}/{total}] {fut.result()}")
+                    except Exception as e:
+                        print(f"\n[{i}/{total}] [错误] 处理 {v.name} 失败: {e}")
         print("\n全部完成。")
+    except KeyboardInterrupt:
+        print("\n已中断。用 --skip-existing 重跑可从断点继续")
     finally:
         pid_file_path(out_root).unlink(missing_ok=True)
 
