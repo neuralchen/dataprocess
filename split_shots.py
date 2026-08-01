@@ -22,12 +22,17 @@
 
 import argparse
 import hashlib
+import os
+import signal
 import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime
 from pathlib import Path
 
 try:
+    import cv2
+    import numpy as np
     from scenedetect import open_video, SceneManager
     from scenedetect.detectors import AdaptiveDetector, ContentDetector, HistogramDetector
 except ImportError:
@@ -104,6 +109,134 @@ def merge_short_scenes(shots, min_len_sec: float):
     return merged
 
 
+# ---------- 后台运行机制 ----------
+
+def pid_file_path(out_root: Path) -> Path:
+    return out_root / ".split_shots.pid"
+
+
+def read_pid(out_root: Path):
+    try:
+        return int(pid_file_path(out_root).read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return None
+
+
+def is_running(pid: int) -> bool:
+    """检查进程是否存活（跨平台）。"""
+    if os.name == "nt":
+        out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
+                             capture_output=True, text=True).stdout
+        return str(pid) in out
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def launch_background(out_root: Path) -> None:
+    """把当前命令（去掉 --background）作为独立后台进程重新启动，日志写入文件。"""
+    pid = read_pid(out_root)
+    if pid and is_running(pid):
+        sys.exit(f"已有后台任务在运行 (PID {pid})，请先 --stop 或等待其完成")
+    out_root.mkdir(parents=True, exist_ok=True)
+    log_path = out_root / f"split_shots_{datetime.now():%Y%m%d_%H%M%S}.log"
+    argv = [a for a in sys.argv[1:] if a != "--background"]
+    cmd = [sys.executable, "-u", str(Path(__file__).resolve())] + argv
+    with open(log_path, "ab") as lf:
+        if os.name == "nt":
+            flags = (subprocess.DETACHED_PROCESS |
+                     subprocess.CREATE_NEW_PROCESS_GROUP |
+                     subprocess.CREATE_NO_WINDOW)
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, creationflags=flags)
+        else:
+            proc = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT,
+                                    stdin=subprocess.DEVNULL, start_new_session=True)
+    pid_file_path(out_root).write_text(str(proc.pid))
+    print(f"已转入后台运行 (PID {proc.pid})")
+    print(f"日志: {log_path}")
+    print(f"查看进度: python {Path(__file__).name} <输入目录> {out_root} --status")
+    print(f"停止任务: python {Path(__file__).name} <输入目录> {out_root} --stop")
+
+
+def show_status(out_root: Path) -> None:
+    pid = read_pid(out_root)
+    if pid and is_running(pid):
+        print(f"后台任务运行中 (PID {pid})")
+    else:
+        print("没有正在运行的后台任务")
+    logs = sorted(out_root.glob("split_shots_*.log"))
+    if logs:
+        print(f"\n最新日志 {logs[-1].name} 末尾:")
+        lines = logs[-1].read_text(errors="replace").splitlines()
+        for line in lines[-15:]:
+            print(f"  {line}")
+
+
+def stop_background(out_root: Path) -> None:
+    pid = read_pid(out_root)
+    if not pid or not is_running(pid):
+        print("没有正在运行的后台任务")
+        return
+    os.kill(pid, signal.SIGTERM)
+    print(f"已停止后台任务 (PID {pid})。用 --skip-existing 重跑可从断点继续")
+    pid_file_path(out_root).unlink(missing_ok=True)
+
+
+# ---------- 视频处理 ----------
+
+def video_duration(path: Path) -> float:
+    """用 ffprobe 读取视频时长（秒）。"""
+    result = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True)
+    try:
+        return float(result.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def measure_motion(video_path: Path, start: float, end: float, samples: int = 6) -> float:
+    """估算镜头内的运动量：等间隔抽帧，计算相邻抽样帧的平均像素差（0-255 尺度）。
+    logo/片头/片尾画面通常接近静止，运动量趋近 0；正常内容镜头明显更高。"""
+    cap = cv2.VideoCapture(str(video_path))
+    times = np.linspace(start, end, samples + 2)[1:-1]  # 取镜头内部的采样点
+    prev, diffs = None, []
+    for t in times:
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+        ret, frame = cap.read()
+        if not ret:
+            continue
+        gray = cv2.cvtColor(cv2.resize(frame, (96, 96)), cv2.COLOR_BGR2GRAY).astype(np.float32)
+        if prev is not None:
+            diffs.append(float(np.abs(gray - prev).mean()))
+        prev = gray
+    cap.release()
+    return float(np.mean(diffs)) if diffs else 0.0
+
+
+def auto_trim_static(video_path: Path, kept, motion_thr: float, window_sec: float):
+    """去掉开头/结尾窗口内接近静止的镜头（残留的 logo、片名、结尾定帧等）。
+    从头部逐个检查：镜头起点在窗口内且运动量低于阈值则丢弃，遇到动态镜头即停；尾部同理。
+    返回 (剩余镜头, 头部去掉数, 尾部去掉数)。"""
+    head_dropped = 0
+    origin = kept[0][0] if kept else 0.0
+    while len(kept) > 1 and kept[0][0] - origin < window_sec and \
+            measure_motion(video_path, *kept[0]) < motion_thr:
+        kept.pop(0)
+        head_dropped += 1
+    tail_dropped = 0
+    tail_end = kept[-1][1] if kept else 0.0
+    while len(kept) > 1 and tail_end - kept[-1][1] < window_sec and \
+            measure_motion(video_path, *kept[-1]) < motion_thr:
+        kept.pop()
+        tail_dropped += 1
+    return kept, head_dropped, tail_dropped
+
+
 def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
                  aggressive: bool = False):
     """用 PySceneDetect 检测镜头边界，返回 [(start_sec, end_sec), ...]。
@@ -133,7 +266,7 @@ def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
     scene_manager.add_detector(
         HistogramDetector(threshold=hist_threshold, min_scene_len=min_len)
     )
-    scene_manager.detect_scenes(video, show_progress=True)
+    scene_manager.detect_scenes(video, show_progress=sys.stderr.isatty())
     scene_list = scene_manager.get_scene_list()
     shots = [(start.get_seconds(), end.get_seconds()) for start, end in scene_list]
     return merge_short_scenes(shots, min_scene_len_sec)
@@ -185,7 +318,7 @@ def convert_full(src: Path, dst: Path, args) -> bool:
 
 def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     rel = video.relative_to(in_dir)
-    print(f"\n=== 处理: {rel} ===")
+    print(f"=== 处理: {rel} ===")
     shots = detect_shots(video, args.threshold, args.min_scene_len, args.aggressive)
     total = len(shots)
     print(f"  检测到 {total} 个镜头")
@@ -194,6 +327,10 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
 
     # 只有一个镜头（或未检测到边界）：不拆分、不去头尾，整段转成目标质量/帧率
     if total <= 1:
+        duration = video_duration(video)
+        if duration < args.min_clip:
+            print(f"  只有一个镜头且时长 {duration:.1f}s 不足 {args.min_clip:g}s，跳过")
+            return
         out_dir = out_root / rel.parent / video.stem
         out_dir.mkdir(parents=True, exist_ok=True)
         dst = out_dir / f"{video.stem}_shot_001{ext}"
@@ -210,7 +347,23 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     if not kept:
         print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个后没有剩余片段，跳过")
         return
-    print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个，保留 {len(kept)} 个片段")
+    print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个", end="")
+
+    # 自动去除残留的静态 logo/片名/定帧镜头
+    if not args.no_auto_trim:
+        kept, head_n, tail_n = auto_trim_static(
+            video, kept, args.motion_threshold, args.trim_window)
+        if head_n or tail_n:
+            print(f"，再自动去除静态镜头（片头 {head_n} 个、片尾 {tail_n} 个）", end="")
+
+    # 丢弃过短的片段
+    long_enough = [(s, e) for s, e in kept if e - s >= args.min_clip]
+    if len(long_enough) < len(kept):
+        print(f"，丢弃短于 {args.min_clip:g}s 的片段 {len(kept) - len(long_enough)} 个", end="")
+    kept = long_enough
+    print(f"，保留 {len(kept)} 个片段")
+    if not kept:
+        return
 
     # 维持输入文件夹的路径结构，再按原视频名建立输出文件夹
     out_dir = out_root / rel.parent / video.stem
@@ -245,6 +398,21 @@ def main():
                         help="最短镜头时长（秒），短于此的段会并入相邻镜头")
     parser.add_argument("--aggressive", action="store_true",
                         help="激进检测模式：各检测器灵敏度大幅调高，几乎不漏切但切得更碎")
+    parser.add_argument("--min-clip", type=float, default=15.0,
+                        help="输出片段的最短时长（秒），短于此的片段直接丢弃；"
+                             "单镜头视频总时长不足时也会跳过")
+    parser.add_argument("--motion-threshold", type=float, default=1.0,
+                        help="静态镜头判定的运动量阈值（0-255 像素差尺度），低于此视为静态 logo/定帧")
+    parser.add_argument("--trim-window", type=float, default=15.0,
+                        help="自动静态修剪只作用于开头/结尾各这么多秒内的镜头")
+    parser.add_argument("--no-auto-trim", action="store_true",
+                        help="关闭对残留静态 logo/片名/定帧镜头的自动修剪")
+    parser.add_argument("--background", action="store_true",
+                        help="转入后台运行，日志写入输出目录下的 split_shots_*.log")
+    parser.add_argument("--status", action="store_true",
+                        help="查看后台任务状态和最新日志")
+    parser.add_argument("--stop", action="store_true",
+                        help="停止正在运行的后台任务")
     parser.add_argument("--fps", type=float, default=25,
                         help="输出帧率")
     parser.add_argument("--crf", type=int, default=16,
@@ -261,10 +429,21 @@ def main():
                         help="跳过已存在的输出片段（断点续跑）")
     args = parser.parse_args()
 
+    out_root = Path(args.output).expanduser().resolve()
+    if args.status:
+        show_status(out_root)
+        return
+    if args.stop:
+        stop_background(out_root)
+        return
+
     in_dir = Path(args.input).expanduser().resolve()
     if not in_dir.is_dir():
         sys.exit(f"输入文件夹不存在: {in_dir}")
-    out_root = Path(args.output).expanduser().resolve()
+
+    if args.background:
+        launch_background(out_root)
+        return
 
     videos = find_videos(in_dir)
     # 避免把输出目录里的片段再当作输入
@@ -277,13 +456,19 @@ def main():
         print("正在扫描重复视频 ...")
         videos = dedupe_videos(videos, in_dir)
     print(f"待处理 {len(videos)} 个视频，输出目录: {out_root}")
-    for v in videos:
-        try:
-            process_video(v, in_dir, out_root, args)
-        except Exception as e:
-            print(f"  [错误] 处理 {v.name} 失败: {e}")
 
-    print("\n全部完成。")
+    out_root.mkdir(parents=True, exist_ok=True)
+    pid_file_path(out_root).write_text(str(os.getpid()))
+    try:
+        for i, v in enumerate(videos, 1):
+            try:
+                print(f"\n[{i}/{len(videos)}] ", end="")
+                process_video(v, in_dir, out_root, args)
+            except Exception as e:
+                print(f"  [错误] 处理 {v.name} 失败: {e}")
+        print("\n全部完成。")
+    finally:
+        pid_file_path(out_root).unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
