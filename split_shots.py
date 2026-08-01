@@ -433,8 +433,12 @@ def normalize_name(name: str) -> str:
 def load_processed_index(dirs) -> dict:
     """扫描一个或多个结果目录中的 scene.json / scenes.json，建立"已处理视频"索引。
     该文件只在视频分析完成后写入，因此它的存在即代表该视频已处理完毕。"""
+    # fp_sizes: 带指纹记录的源文件大小集合。指纹的计算包含了文件大小，
+    # 因此大小不在此集合中的视频不可能指纹相同，可直接跳过昂贵的读取校验。
+    # fp_any_size: 存在"有指纹但没记录大小"的旧记录，此时无法用大小做门槛。
     index = {"paths": set(), "fingerprints": set(), "name_size": set(),
-             "names": set(), "norms": set(), "count": 0}
+             "names": set(), "norms": set(), "fp_sizes": set(),
+             "fp_any_size": False, "count": 0}
     for d in dirs:
         root = Path(d).expanduser().resolve()
         if not root.is_dir():
@@ -460,6 +464,10 @@ def load_processed_index(dirs) -> dict:
                 index["norms"].add(normalize_name(sj.parent.name))
                 if data.get("source_fingerprint"):
                     index["fingerprints"].add(data["source_fingerprint"])
+                    if data.get("source_size"):
+                        index["fp_sizes"].add(int(data["source_size"]))
+                    else:
+                        index["fp_any_size"] = True
                 if data.get("source_size"):
                     index["name_size"].add((name, int(data["source_size"])))
                 index["count"] += 1
@@ -473,19 +481,23 @@ def match_processed(video: Path, index: dict, match_by_name: bool):
     按代价从低到高依次尝试，指纹匹配放最后（需要读取文件内容）。"""
     if str(video) in index["paths"]:
         return "路径匹配"
-    if index["name_size"]:
-        try:
-            if (video.name, video.stat().st_size) in index["name_size"]:
-                return "文件名+大小匹配"
-        except OSError:
-            pass
+    try:
+        size = video.stat().st_size
+    except OSError:
+        size = None
+    if index["name_size"] and size is not None:
+        if (video.name, size) in index["name_size"]:
+            return "文件名+大小匹配"
     if match_by_name:
         if video.name in index["names"]:
             return "文件名匹配"
         if normalize_name(video.name) in index["norms"]:
             return "归一化名称匹配"
-    if index["fingerprints"] and file_fingerprint(video) in index["fingerprints"]:
-        return "内容指纹匹配"
+    # 指纹校验需要读文件，先用大小做门槛：大小不同则指纹必然不同
+    if index["fingerprints"] and (
+            index["fp_any_size"] or size is None or size in index["fp_sizes"]):
+        if file_fingerprint(video) in index["fingerprints"]:
+            return "内容指纹匹配"
     return None
 
 
