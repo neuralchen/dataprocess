@@ -539,7 +539,10 @@ def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
     )
     scene_manager.detect_scenes(video, show_progress=show_progress)
     scene_list = scene_manager.get_scene_list()
-    shots = [(start.get_seconds(), end.get_seconds()) for start, end in scene_list]
+    # scenedetect 0.7 起 get_seconds() 被 seconds 属性取代，两个版本都要兼容
+    def secs(t):
+        return t.seconds if hasattr(t, "seconds") else t.get_seconds()
+    shots = [(secs(start), secs(end)) for start, end in scene_list]
     return merge_short_scenes(shots, min_scene_len_sec)
 
 
@@ -644,7 +647,8 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> str:
     if len(long_enough) < len(kept_idx):
         log.part(f"，丢弃短于 {args.min_clip:g}s 的片段 {len(kept_idx) - len(long_enough)} 个")
     kept_idx = long_enough
-    log.add(f"，保留 {len(kept_idx)} 个片段")
+    log.part(f"，保留 {len(kept_idx)} 个片段")
+    log.flush()
     if not kept_idx:
         write_scene_json(out_dir, video, shots, {}, args)
         return log.text()
