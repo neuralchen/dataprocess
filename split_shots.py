@@ -241,8 +241,14 @@ def auto_trim_static(video_path: Path, shots, kept_idx, motion_thr: float, windo
 def write_scene_json(out_dir: Path, video: Path, shots, outputs, args) -> None:
     """在视频的输出文件夹下写 scene.json，记录全部检测场景与已导出片段的路径。
     outputs: {scene_index: 输出文件路径}，未导出的场景 output_path 为 null。"""
+    try:
+        source_size = video.stat().st_size
+    except OSError:
+        source_size = None
     data = {
         "source_video": str(video),
+        "source_size": source_size,
+        "source_fingerprint": file_fingerprint(video),
         "detector": "content+adaptive+histogram",
         "aggressive": args.aggressive,
         "threshold": args.threshold,
@@ -270,6 +276,76 @@ def write_scene_json(out_dir: Path, video: Path, shots, outputs, args) -> None:
     }
     (out_dir / "scene.json").write_text(
         json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_processed_index(dirs) -> dict:
+    """扫描一个或多个结果目录中的 scene.json，建立"已处理视频"索引。
+    scene.json 只在片段导出完成后写入，因此它的存在即代表该视频已处理完毕。"""
+    index = {"paths": set(), "fingerprints": set(), "name_size": set(),
+             "names": set(), "count": 0}
+    for d in dirs:
+        root = Path(d).expanduser().resolve()
+        if not root.is_dir():
+            print(f"  [警告] 结果目录不存在，已忽略: {root}")
+            continue
+        found = 0
+        for sj in root.rglob("scene.json"):
+            try:
+                data = json.loads(sj.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                print(f"  [警告] 无法解析，已忽略: {sj}")
+                continue
+            src = data.get("source_video")
+            if not src:
+                continue
+            name = Path(src).name
+            index["paths"].add(str(Path(src)))
+            index["names"].add(name)
+            if data.get("source_fingerprint"):
+                index["fingerprints"].add(data["source_fingerprint"])
+            if data.get("source_size"):
+                index["name_size"].add((name, int(data["source_size"])))
+            index["count"] += 1
+            found += 1
+        print(f"  {root}: {found} 条已处理记录")
+    return index
+
+
+def match_processed(video: Path, index: dict, match_by_name: bool):
+    """判断视频是否已被处理过，返回匹配依据（未匹配则返回 None）。
+    按代价从低到高依次尝试，指纹匹配放最后（需要读取文件内容）。"""
+    if str(video) in index["paths"]:
+        return "路径匹配"
+    if index["name_size"]:
+        try:
+            if (video.name, video.stat().st_size) in index["name_size"]:
+                return "文件名+大小匹配"
+        except OSError:
+            pass
+    if match_by_name and video.name in index["names"]:
+        return "文件名匹配"
+    if index["fingerprints"] and file_fingerprint(video) in index["fingerprints"]:
+        return "内容指纹匹配"
+    return None
+
+
+def filter_processed(videos, in_dir: Path, scan_dirs, match_by_name: bool, verbose: bool):
+    """从待处理列表中剔除已处理过的视频，返回 (剩余视频, 已处理视频及其匹配依据)。"""
+    print("正在扫描已处理结果 ...")
+    index = load_processed_index(scan_dirs)
+    print(f"共载入 {index['count']} 条已处理记录")
+    if not index["count"]:
+        return videos, []
+    remaining, done = [], []
+    for v in videos:
+        reason = match_processed(v, index, match_by_name)
+        if reason:
+            done.append((v, reason))
+            if verbose:
+                print(f"  [已处理] {v.relative_to(in_dir)}  ({reason})")
+        else:
+            remaining.append(v)
+    return remaining, done
 
 
 def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
@@ -363,11 +439,12 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     # 只有一个镜头（或未检测到边界）：不拆分、不去头尾，整段转成目标质量/帧率
     if total <= 1:
         duration = video_duration(video)
-        if duration < args.min_clip:
-            print(f"  只有一个镜头且时长 {duration:.1f}s 不足 {args.min_clip:g}s，跳过")
-            return
         out_dir = out_root / rel.parent / video.stem
         out_dir.mkdir(parents=True, exist_ok=True)
+        if duration < args.min_clip:
+            print(f"  只有一个镜头且时长 {duration:.1f}s 不足 {args.min_clip:g}s，跳过")
+            write_scene_json(out_dir, video, [(0.0, duration)], {}, args)
+            return
         dst = out_dir / f"{video.stem}_scene_0000{ext}"
         whole = [(0.0, duration)]
         if args.skip_existing and dst.exists():
@@ -382,10 +459,15 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
             write_scene_json(out_dir, video, whole, {}, args)
         return
 
+    # 维持输入文件夹的路径结构，再按原视频名建立输出文件夹
+    out_dir = out_root / rel.parent / video.stem
+    out_dir.mkdir(parents=True, exist_ok=True)
+
     # 去掉片头（封面）和片尾片段（基于场景索引操作，便于在 scene.json 中溯源）
     kept_idx = list(range(total))[args.skip_head: total - args.skip_tail if args.skip_tail else None]
     if not kept_idx:
         print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个后没有剩余片段，跳过")
+        write_scene_json(out_dir, video, shots, {}, args)
         return
     print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个", end="")
 
@@ -403,11 +485,8 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     kept_idx = long_enough
     print(f"，保留 {len(kept_idx)} 个片段")
     if not kept_idx:
+        write_scene_json(out_dir, video, shots, {}, args)
         return
-
-    # 维持输入文件夹的路径结构，再按原视频名建立输出文件夹
-    out_dir = out_root / rel.parent / video.stem
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     ok = 0
     outputs = {}
@@ -468,6 +547,14 @@ def main():
                         help="x264 编码速度预设，越慢压缩效率越高（同 CRF 下文件更小）")
     parser.add_argument("--copy", action="store_true",
                         help="流复制模式：不重编码、不改帧率，速度极快但切点对齐关键帧")
+    parser.add_argument("--skip-processed", action="store_true",
+                        help="跳过已处理过的视频（扫描输出目录中的 scene.json 判断）")
+    parser.add_argument("--processed-dir", nargs="+", metavar="DIR",
+                        help="额外扫描这些历史结果目录（可指定多个），隐含开启 --skip-processed")
+    parser.add_argument("--match-by-name", action="store_true",
+                        help="已处理判定放宽到仅文件名匹配（默认用路径、文件名+大小、内容指纹匹配）")
+    parser.add_argument("--scan-only", action="store_true",
+                        help="只扫描并报告哪些视频已处理/待处理，不做任何转码")
     parser.add_argument("--no-dedup", action="store_true",
                         help="不做重复视频检测（默认会按内容指纹去重，重复的只处理一次）")
     parser.add_argument("--skip-existing", action="store_true",
@@ -497,6 +584,27 @@ def main():
         sys.exit(f"在 {in_dir} 中没有找到视频文件（支持: {', '.join(sorted(VIDEO_EXTS))}）")
 
     print(f"找到 {len(videos)} 个视频")
+
+    # 扫描历史结果，跳过已处理过的视频
+    done = []
+    if args.skip_processed or args.processed_dir or args.scan_only:
+        # 输出目录首次运行时不存在属正常情况，不计入扫描（避免误报警告）
+        scan_dirs = ([str(out_root)] if out_root.is_dir() else []) + list(args.processed_dir or [])
+        videos, done = filter_processed(
+            videos, in_dir, scan_dirs, args.match_by_name, args.scan_only)
+        print(f"已处理 {len(done)} 个（跳过），剩余 {len(videos)} 个待处理")
+
+    if args.scan_only:
+        if videos:
+            print("\n待处理视频:")
+            for v in videos:
+                print(f"  {v.relative_to(in_dir)}")
+        return
+
+    if not videos:
+        print("没有需要处理的视频。")
+        return
+
     if not args.no_dedup:
         print("正在扫描重复视频 ...")
         videos = dedupe_videos(videos, in_dir)
