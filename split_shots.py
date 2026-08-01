@@ -22,12 +22,13 @@
 
 import argparse
 import hashlib
+import json
 import os
 import signal
 import subprocess
 import sys
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 try:
@@ -218,23 +219,57 @@ def measure_motion(video_path: Path, start: float, end: float, samples: int = 6)
     return float(np.mean(diffs)) if diffs else 0.0
 
 
-def auto_trim_static(video_path: Path, kept, motion_thr: float, window_sec: float):
+def auto_trim_static(video_path: Path, shots, kept_idx, motion_thr: float, window_sec: float):
     """去掉开头/结尾窗口内接近静止的镜头（残留的 logo、片名、结尾定帧等）。
     从头部逐个检查：镜头起点在窗口内且运动量低于阈值则丢弃，遇到动态镜头即停；尾部同理。
-    返回 (剩余镜头, 头部去掉数, 尾部去掉数)。"""
+    操作的是场景索引列表，返回 (剩余索引, 头部去掉数, 尾部去掉数)。"""
     head_dropped = 0
-    origin = kept[0][0] if kept else 0.0
-    while len(kept) > 1 and kept[0][0] - origin < window_sec and \
-            measure_motion(video_path, *kept[0]) < motion_thr:
-        kept.pop(0)
+    origin = shots[kept_idx[0]][0] if kept_idx else 0.0
+    while len(kept_idx) > 1 and shots[kept_idx[0]][0] - origin < window_sec and \
+            measure_motion(video_path, *shots[kept_idx[0]]) < motion_thr:
+        kept_idx.pop(0)
         head_dropped += 1
     tail_dropped = 0
-    tail_end = kept[-1][1] if kept else 0.0
-    while len(kept) > 1 and tail_end - kept[-1][1] < window_sec and \
-            measure_motion(video_path, *kept[-1]) < motion_thr:
-        kept.pop()
+    tail_end = shots[kept_idx[-1]][1] if kept_idx else 0.0
+    while len(kept_idx) > 1 and tail_end - shots[kept_idx[-1]][1] < window_sec and \
+            measure_motion(video_path, *shots[kept_idx[-1]]) < motion_thr:
+        kept_idx.pop()
         tail_dropped += 1
-    return kept, head_dropped, tail_dropped
+    return kept_idx, head_dropped, tail_dropped
+
+
+def write_scene_json(out_dir: Path, video: Path, shots, outputs, args) -> None:
+    """在视频的输出文件夹下写 scene.json，记录全部检测场景与已导出片段的路径。
+    outputs: {scene_index: 输出文件路径}，未导出的场景 output_path 为 null。"""
+    data = {
+        "source_video": str(video),
+        "detector": "content+adaptive+histogram",
+        "aggressive": args.aggressive,
+        "threshold": args.threshold,
+        "min_scene_len": args.min_scene_len,
+        "min_scene_seconds": args.min_clip,
+        "split_mode": "copy" if args.copy else "encode",
+        "fps": args.fps,
+        "crf": args.crf,
+        "preset": args.preset,
+        "skip_head": args.skip_head,
+        "skip_tail": args.skip_tail,
+        "detected_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "scene_count": len(shots),
+        "scenes": [
+            {
+                "scene_index": i,
+                "start_time": round(start, 3),
+                "end_time": round(end, 3),
+                "duration": round(end - start, 3),
+                "output_path": str(outputs[i]) if i in outputs else None,
+                "thumbnail": None,
+            }
+            for i, (start, end) in enumerate(shots)
+        ],
+    }
+    (out_dir / "scene.json").write_text(
+        json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
@@ -333,36 +368,41 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
             return
         out_dir = out_root / rel.parent / video.stem
         out_dir.mkdir(parents=True, exist_ok=True)
-        dst = out_dir / f"{video.stem}_shot_001{ext}"
+        dst = out_dir / f"{video.stem}_scene_0000{ext}"
+        whole = [(0.0, duration)]
         if args.skip_existing and dst.exists():
             print("  只有一个镜头，输出已存在，跳过")
+            write_scene_json(out_dir, video, whole, {0: dst}, args)
             return
         print("  只有一个镜头，整段转码输出")
         if convert_full(video, dst, args):
             print(f"  完成: 已保存到 {dst}")
+            write_scene_json(out_dir, video, whole, {0: dst}, args)
+        else:
+            write_scene_json(out_dir, video, whole, {}, args)
         return
 
-    # 去掉片头（封面）和片尾片段
-    kept = shots[args.skip_head: total - args.skip_tail if args.skip_tail else None]
-    if not kept:
+    # 去掉片头（封面）和片尾片段（基于场景索引操作，便于在 scene.json 中溯源）
+    kept_idx = list(range(total))[args.skip_head: total - args.skip_tail if args.skip_tail else None]
+    if not kept_idx:
         print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个后没有剩余片段，跳过")
         return
     print(f"  去掉片头 {args.skip_head} 个、片尾 {args.skip_tail} 个", end="")
 
     # 自动去除残留的静态 logo/片名/定帧镜头
     if not args.no_auto_trim:
-        kept, head_n, tail_n = auto_trim_static(
-            video, kept, args.motion_threshold, args.trim_window)
+        kept_idx, head_n, tail_n = auto_trim_static(
+            video, shots, kept_idx, args.motion_threshold, args.trim_window)
         if head_n or tail_n:
             print(f"，再自动去除静态镜头（片头 {head_n} 个、片尾 {tail_n} 个）", end="")
 
     # 丢弃过短的片段
-    long_enough = [(s, e) for s, e in kept if e - s >= args.min_clip]
-    if len(long_enough) < len(kept):
-        print(f"，丢弃短于 {args.min_clip:g}s 的片段 {len(kept) - len(long_enough)} 个", end="")
-    kept = long_enough
-    print(f"，保留 {len(kept)} 个片段")
-    if not kept:
+    long_enough = [i for i in kept_idx if shots[i][1] - shots[i][0] >= args.min_clip]
+    if len(long_enough) < len(kept_idx):
+        print(f"，丢弃短于 {args.min_clip:g}s 的片段 {len(kept_idx) - len(long_enough)} 个", end="")
+    kept_idx = long_enough
+    print(f"，保留 {len(kept_idx)} 个片段")
+    if not kept_idx:
         return
 
     # 维持输入文件夹的路径结构，再按原视频名建立输出文件夹
@@ -370,15 +410,20 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ok = 0
-    for i, (start, end) in enumerate(kept, 1):
-        dst = out_dir / f"{video.stem}_shot_{i:03d}{ext}"
+    outputs = {}
+    for n, idx in enumerate(kept_idx, 1):
+        start, end = shots[idx]
+        dst = out_dir / f"{video.stem}_scene_{idx:04d}{ext}"
         if args.skip_existing and dst.exists():
+            outputs[idx] = dst
             ok += 1
             continue
         if cut_segment(video, dst, start, end, args):
+            outputs[idx] = dst
             ok += 1
-            print(f"    [{i}/{len(kept)}] {dst.name}  ({start:.2f}s - {end:.2f}s)")
-    print(f"  完成: {ok}/{len(kept)} 个片段已保存到 {out_dir}")
+            print(f"    [{n}/{len(kept_idx)}] {dst.name}  ({start:.2f}s - {end:.2f}s)")
+    write_scene_json(out_dir, video, shots, outputs, args)
+    print(f"  完成: {ok}/{len(kept_idx)} 个片段已保存到 {out_dir}，场景记录已写入 scene.json")
 
 
 def main():
