@@ -171,14 +171,15 @@ def build_job_yaml(cfg, shard_total, nodes):
     image = cfg.get("image", "video-pipeline:latest")
     inp, outp = cfg["input"], cfg["output"]
 
-    # 工作脚本：容器内直接调用挂载进来的项目代码
-    script = (
-        "set -e; "
-        "IDX=${JOB_COMPLETION_INDEX:-0}; "
-        f"echo \"分片 $IDX/{shard_total} 在 $(hostname) 启动\"; "
+    # 工作脚本用 YAML 块标量嵌入，避免脚本里的引号破坏 YAML 结构
+    script_lines = [
+        "set -e",
+        "IDX=${JOB_COMPLETION_INDEX:-0}",
+        f'echo "分片 $IDX/{shard_total} 在 $(hostname) 启动"',
         f"exec python3 /project/split_shots.py '{inp}' '{outp}' "
-        f"--shard $IDX/{shard_total} {opts}"
-    )
+        f"--shard $IDX/{shard_total} {opts}",
+    ]
+    script = "\n".join(" " * 12 + ln for ln in script_lines)
     return name, f"""apiVersion: batch/v1
 kind: Job
 metadata:
@@ -204,8 +205,10 @@ spec:
       - name: worker
         image: {image}
         imagePullPolicy: IfNotPresent
-        command: ["bash","-lc"]
-        args: ["{script}"]
+        command: ["bash", "-c"]
+        args:
+          - |
+{script}
         env:
         - name: NVIDIA_VISIBLE_DEVICES
           value: "all"
