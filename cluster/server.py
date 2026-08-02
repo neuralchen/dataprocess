@@ -201,6 +201,16 @@ spec:
     spec:
       restartPolicy: Never
       runtimeClassName: nvidia
+      # 优先把各分片分散到不同节点，充分利用整个集群的算力
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+          - weight: 100
+            podAffinityTerm:
+              topologyKey: kubernetes.io/hostname
+              labelSelector:
+                matchLabels:
+                  job-name: {name}
       containers:
       - name: worker
         image: {image}
