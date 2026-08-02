@@ -28,6 +28,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -238,9 +239,12 @@ def resolve_parallel(args) -> tuple:
     return jobs, threads
 
 
-def video_encode_args(args) -> list:
+def video_encode_args(args, force_cpu: bool = False) -> list:
     """按所选编码器生成 ffmpeg 的视频编码参数。"""
     quality = args.cq if args.cq is not None else args.crf
+    if force_cpu:
+        return ["-c:v", "libx264", "-preset", "veryfast", "-crf", str(args.crf),
+                "-pix_fmt", "yuv420p", "-threads", "2"]
     if args.encoder == "cpu":
         cmd = ["-c:v", "libx264", "-preset", args.preset, "-crf", str(args.crf),
                "-pix_fmt", "yuv420p"]
@@ -258,8 +262,10 @@ def video_encode_args(args) -> list:
     return cmd
 
 
-def decode_accel_args(args) -> list:
+def decode_accel_args(args, force_cpu: bool = False) -> list:
     """硬件解码加速（放在 -i 之前）。"""
+    if force_cpu:
+        return []
     if args.encoder.startswith("nvenc"):
         return ["-hwaccel", "cuda"]
     if args.encoder == "videotoolbox":
@@ -609,45 +615,71 @@ def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
     return merge_short_scenes(shots, min_scene_len_sec)
 
 
+NVENC_BUSY_MARKERS = ("OpenEncodeSessionEx", "incompatible client key", "No capable devices")
+
+
+def run_ffmpeg(build_cmd, args, log: Log, what: str) -> bool:
+    """执行 ffmpeg，NVENC 会话耗尽时重试，仍失败则降级到 CPU 编码。
+
+    消费级显卡的 NVENC 并发会话上限是整机 8 路（多卡也不叠加），
+    并行度偏高时可能短暂超限。没有这层保护的话该片段会被静默丢弃。
+
+    build_cmd(force_cpu) 需返回对应编码方式的完整 ffmpeg 命令。
+    """
+    for attempt in range(3):
+        result = subprocess.run(build_cmd(False), capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        err = result.stderr.strip()
+        if not any(m in err for m in NVENC_BUSY_MARKERS):
+            log.add(f"    [错误] ffmpeg {what} 失败\n{err}")
+            return False
+        if attempt < 2:
+            time.sleep(5 * (attempt + 1))  # 等其它任务释放会话
+    log.add(f"    [降级] NVENC 会话不足，改用 CPU 编码: {what}")
+    fb = subprocess.run(build_cmd(True), capture_output=True, text=True)
+    if fb.returncode == 0:
+        return True
+    log.add(f"    [错误] ffmpeg {what} 降级后仍失败\n{fb.stderr.strip()}")
+    return False
+
+
 def cut_segment(src: Path, dst: Path, start: float, end: float, args, log: Log) -> bool:
     """用 ffmpeg 切出 [start, end) 片段。返回是否成功。"""
     duration = end - start
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-    if not args.copy:
-        cmd += decode_accel_args(args)
-    cmd += ["-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}"]
-    if args.copy:
-        # 流复制：速度快，不改帧率，切点会对齐到关键帧，可能有少许偏差
-        cmd += ["-c", "copy"]
-    else:
-        # 重编码：切点精确到帧，统一输出帧率
-        cmd += ["-r", str(args.fps)] + video_encode_args(args) + \
-               ["-c:a", "aac", "-b:a", "192k"]
-    cmd += ["-avoid_negative_ts", "make_zero", str(dst)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.add(f"    [错误] ffmpeg 切割失败: {dst.name}\n{result.stderr.strip()}")
-        return False
-    return True
+
+    def build(force_cpu):
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        if not args.copy:
+            cmd += decode_accel_args(args, force_cpu)
+        cmd += ["-ss", f"{start:.3f}", "-i", str(src), "-t", f"{duration:.3f}"]
+        if args.copy:
+            # 流复制：速度快，不改帧率，切点会对齐到关键帧，可能有少许偏差
+            cmd += ["-c", "copy"]
+        else:
+            # 重编码：切点精确到帧，统一输出帧率
+            cmd += ["-r", str(args.fps)] + video_encode_args(args, force_cpu) + \
+                   ["-c:a", "aac", "-b:a", "192k"]
+        return cmd + ["-avoid_negative_ts", "make_zero", str(dst)]
+
+    return run_ffmpeg(build, args, log, f"切割 {dst.name}")
 
 
 def convert_full(src: Path, dst: Path, args, log: Log) -> bool:
     """不切割，整段按目标质量/帧率转码（--copy 模式下为直接复制流）。"""
-    cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
-    if not args.copy:
-        cmd += decode_accel_args(args)
-    cmd += ["-i", str(src)]
-    if args.copy:
-        cmd += ["-c", "copy"]
-    else:
-        cmd += ["-r", str(args.fps)] + video_encode_args(args) + \
-               ["-c:a", "aac", "-b:a", "192k"]
-    cmd.append(str(dst))
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        log.add(f"    [错误] ffmpeg 转码失败: {dst.name}\n{result.stderr.strip()}")
-        return False
-    return True
+    def build(force_cpu):
+        cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y"]
+        if not args.copy:
+            cmd += decode_accel_args(args, force_cpu)
+        cmd += ["-i", str(src)]
+        if args.copy:
+            cmd += ["-c", "copy"]
+        else:
+            cmd += ["-r", str(args.fps)] + video_encode_args(args, force_cpu) + \
+                   ["-c:a", "aac", "-b:a", "192k"]
+        return cmd + [str(dst)]
+
+    return run_ffmpeg(build, args, log, f"转码 {dst.name}")
 
 
 def process_video(video: Path, in_dir: Path, out_root: Path, args) -> str:
