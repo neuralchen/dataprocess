@@ -23,6 +23,9 @@ from urllib.parse import urlparse, parse_qs
 HERE = Path(__file__).resolve().parent
 NAMESPACE = "video-pipeline"
 JOB_PREFIX = "vsplit"
+# worker 容器以此身份运行，保证产出文件归宿主机普通用户所有
+RUN_UID = int(os.environ.get("PIPELINE_UID", "1000"))
+RUN_GID = int(os.environ.get("PIPELINE_GID", "1000"))
 # 各节点的处理能力权重（按 CPU 核数），用于分片时按算力分配
 CACHE_TTL = 5.0
 
@@ -201,6 +204,12 @@ spec:
     spec:
       restartPolicy: Never
       runtimeClassName: nvidia
+      # 以宿主机的 ubuntu 用户身份运行，产出文件才归普通用户所有，
+      # 否则输出全是 root 属主，日常管理都要 sudo
+      securityContext:
+        runAsUser: {RUN_UID}
+        runAsGroup: {RUN_GID}
+        fsGroup: {RUN_GID}
       # 优先把各分片分散到不同节点，充分利用整个集群的算力
       affinity:
         podAntiAffinity:
