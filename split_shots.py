@@ -150,6 +150,27 @@ def cpu_count() -> int:
     return os.cpu_count() or 4
 
 
+def nvidia_gpu_count() -> int:
+    """检测可用的 NVIDIA 显卡数量。"""
+    try:
+        out = subprocess.run(["nvidia-smi", "-L"], capture_output=True,
+                             text=True, timeout=30).stdout
+        return max(1, sum(1 for line in out.splitlines() if line.startswith("GPU ")))
+    except (OSError, subprocess.SubprocessError):
+        return 1
+
+
+def pick_gpu(args) -> int:
+    """为当前工作进程挑选显卡。
+
+    消费级显卡的 NVENC 并发会话数有上限（实测 8 路），多卡轮询可成倍提升总容量。
+    按进程号取模，保证同一 worker 始终用同一张卡且分布均匀。
+    """
+    if args.gpu >= 0:
+        return args.gpu
+    return os.getpid() % max(1, getattr(args, "gpu_count", 1))
+
+
 # 编码器名称 -> 实际的 ffmpeg 编码器
 HW_CODEC = {
     "nvenc": "h264_nvenc",
@@ -230,8 +251,11 @@ def video_encode_args(args) -> list:
         # VideoToolbox 用 -q:v（1-100，越大质量越高），由 CRF 反向映射
         q = max(1, min(100, int(100 - quality * 2.2)))
         return ["-c:v", "h264_videotoolbox", "-q:v", str(q), "-pix_fmt", "yuv420p"]
-    return ["-c:v", HW_CODEC[args.encoder], "-preset", NVENC_PRESET.get(args.preset, "p4"),
-            "-rc", "vbr", "-cq", str(quality), "-b:v", "0", "-pix_fmt", "yuv420p"]
+    cmd = ["-c:v", HW_CODEC[args.encoder], "-preset", NVENC_PRESET.get(args.preset, "p4"),
+           "-rc", "vbr", "-cq", str(quality), "-b:v", "0", "-pix_fmt", "yuv420p"]
+    if getattr(args, "gpu_count", 1) > 1 or args.gpu >= 0:
+        cmd += ["-gpu", str(pick_gpu(args))]
+    return cmd
 
 
 def decode_accel_args(args) -> list:
@@ -760,6 +784,8 @@ def main():
                              "auto=有硬件编码器就用")
     parser.add_argument("--cq", type=int, default=None,
                         help="硬件编码的质量值（越小质量越高），默认沿用 --crf 的取值")
+    parser.add_argument("--gpu", type=int, default=-1,
+                        help="指定使用的显卡编号；-1 为多卡自动轮询（绕开单卡 NVENC 并发上限）")
     parser.add_argument("--fps", type=float, default=25,
                         help="输出帧率")
     parser.add_argument("--crf", type=int, default=16,
@@ -835,11 +861,15 @@ def main():
 
     # 解析编码器与并行度（写回 args，供各工作进程使用）
     args.encoder = resolve_encoder(args)
+    args.gpu_count = nvidia_gpu_count() if args.encoder.startswith("nvenc") else 1
     args.jobs, args.threads = resolve_parallel(args)
     mode = f"GPU ({HW_CODEC[args.encoder]})" if args.encoder != "cpu" else "CPU (libx264)"
     detail = f"{args.jobs} 个并行任务"
     if args.encoder == "cpu":
         detail += f" × 每个 {args.threads} 线程"
+    elif args.encoder.startswith("nvenc"):
+        detail += (f"，{args.gpu_count} 张显卡轮询" if args.gpu < 0 and args.gpu_count > 1
+                   else f"，固定使用显卡 {pick_gpu(args)}")
     print(f"待处理 {len(videos)} 个视频，编码方式: {mode}，{detail}")
     print(f"输出目录: {out_root}")
 
