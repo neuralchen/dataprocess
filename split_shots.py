@@ -55,6 +55,26 @@ def find_videos(folder: Path) -> list[Path]:
                   if p.is_file() and p.suffix.lower() in VIDEO_EXTS)
 
 
+def apply_shard(videos, in_dir: Path, shard: str):
+    """按 "i/N" 取出属于本节点的分片。
+
+    用相对路径的哈希取模，不依赖文件顺序或节点间通信：
+    每个节点独立算出同一份划分，天然不重不漏。
+    """
+    try:
+        idx, total = (int(x) for x in shard.split("/"))
+    except ValueError:
+        sys.exit(f"--shard 格式应为 i/N（如 0/4），收到: {shard}")
+    if total < 1 or not 0 <= idx < total:
+        sys.exit(f"--shard 取值非法: {shard}（需满足 0 <= i < N）")
+    picked = []
+    for v in videos:
+        key = str(v.relative_to(in_dir)).encode("utf-8")
+        if int(hashlib.sha256(key).hexdigest(), 16) % total == idx:
+            picked.append(v)
+    return picked
+
+
 def file_fingerprint(path: Path, chunk: int = 4 * 1024 * 1024) -> str:
     """计算文件内容指纹：大小 + 头/中/尾三段 SHA-256。
     对视频这类大文件比全文件哈希快得多，且几乎不会误判。"""
@@ -835,6 +855,9 @@ def main():
     parser.add_argument("--match-by-name", action="store_true",
                         help="已处理判定放宽到按文件名匹配（含归一化名称，可跨命名风格）；"
                              "默认只用路径、文件名+大小、内容指纹匹配")
+    parser.add_argument("--shard", metavar="i/N",
+                        help="分布式分片：只处理属于第 i 个分片的视频（共 N 片）。"
+                             "各节点按文件路径哈希独立划分，不重不漏")
     parser.add_argument("--scan-only", action="store_true",
                         help="只扫描并报告哪些视频已处理/待处理，不做任何转码")
     parser.add_argument("--no-dedup", action="store_true",
@@ -866,6 +889,10 @@ def main():
         sys.exit(f"在 {in_dir} 中没有找到视频文件（支持: {', '.join(sorted(VIDEO_EXTS))}）")
 
     print(f"找到 {len(videos)} 个视频")
+
+    if args.shard:
+        videos = apply_shard(videos, in_dir, args.shard)
+        print(f"分片 {args.shard}: 本节点负责 {len(videos)} 个视频")
 
     # 扫描历史结果，跳过已处理过的视频
     done = []
