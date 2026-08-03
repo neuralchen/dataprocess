@@ -84,16 +84,34 @@
     <form onsubmit="submitJob(event)">
       <div class="row">
         <div>
+          <label>处理模式</label>
+          <select id="mode" onchange="toggleMode()">
+            <option value="local">就近处理（各节点读写本地盘，零网络 IO）</option>
+            <option value="shared">共享存储（读写 NFS，需填路径）</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" id="sharedFields" style="display:none">
+        <div>
           <label>输入目录（容器内路径）</label>
-          <input id="input" value="/data/input" required>
+          <input id="input" value="/data/input">
         </div>
         <div>
           <label>输出目录（容器内路径）</label>
-          <input id="output" value="/data/output" required>
+          <input id="output" value="/data/output">
         </div>
         <div>
           <label>分片数（留空 = 节点数）</label>
           <input id="shards" type="number" min="1" max="64" placeholder="自动">
+        </div>
+      </div>
+      <div class="row" id="localHint">
+        <div style="grid-column:1/-1; color:var(--dim); font-size:12px; line-height:1.6">
+          就近模式下每个节点只处理自己本地
+          <code class="mono">/mnt/hd/Project/local_data/input</code> 里的素材，
+          产出写到同机的 <code class="mono">output</code>，全程不走网络。
+          先用 <code class="mono">dispatch.py scatter</code> 分发素材，
+          处理完用 <code class="mono">dispatch.py gather</code> 导出。
         </div>
       </div>
       <div class="row">
@@ -202,9 +220,17 @@ function flash(ok, text) {
   setTimeout(() => { m.className = 'msg'; }, 6000);
 }
 
+function toggleMode() {
+  const local = document.getElementById('mode').value === 'local';
+  document.getElementById('sharedFields').style.display = local ? 'none' : '';
+  document.getElementById('localHint').style.display = local ? '' : 'none';
+}
+
 async function submitJob(e) {
   e.preventDefault();
+  const mode = document.getElementById('mode').value;
   const body = {
+    mode: mode,
     input: document.getElementById('input').value.trim(),
     output: document.getElementById('output').value.trim(),
     shards: document.getElementById('shards').value.trim(),
@@ -233,6 +259,7 @@ function refreshAll() {
   if (currentLog) showLogs(currentLog);
 }
 
+toggleMode();
 refreshAll();
 setInterval(() => { loadNodes(); loadJobs(); }, 8000);
 setInterval(() => { if (currentLog) showLogs(currentLog); }, 12000);

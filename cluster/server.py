@@ -45,6 +45,8 @@ ALLOWED_FLAGS = {
 }
 SAFE_VALUE = re.compile(r"^[A-Za-z0-9._%-]+$")
 SAFE_PATH = re.compile(r"^/[A-Za-z0-9._/-]*$")
+# 就近模式下各节点的本地数据根目录（需与 dispatch.py 保持一致）
+LOCAL_ROOT = "/mnt/hd/Project/local_data"
 
 
 def validate_options(text):
@@ -221,6 +223,88 @@ def get_jobs():
     return {"jobs": jobs}
 
 
+def build_local_job_yaml(cfg, shard_idx, shard_total, node_name, stamp):
+    """就近模式：一个节点一个 Job，固定处理自己那一片本地数据。
+
+    与共享存储模式的关键区别是分片号和节点绑死——数据事先按同样的哈希规则
+    分发到各节点本地盘，节点 i 上的素材正好就是 --shard i/N 要处理的那份，
+    整个处理过程零网络 IO。
+    """
+    name = f"{JOB_PREFIX}-{stamp}-{shard_idx}"
+    opts = cfg.get("options", "").strip()
+    image = cfg.get("image", "video-pipeline:latest")
+    script_lines = [
+        "set -e",
+        f'echo "分片 {shard_idx}/{shard_total} 在 $(hostname) 处理本地数据"',
+        f"exec python3 /project/split_shots.py /data/input /data/output "
+        f"--shard {shard_idx}/{shard_total} {opts}",
+    ]
+    script = "\n".join(" " * 12 + ln for ln in script_lines)
+    return name, f"""apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {name}
+  namespace: {NAMESPACE}
+  labels:
+    pipeline/batch: "{stamp}"
+  annotations:
+    pipeline/input: "{LOCAL_ROOT}/input (本地)"
+    pipeline/output: "{LOCAL_ROOT}/output (本地)"
+    pipeline/options: "{opts}"
+    pipeline/mode: "local"
+spec:
+  completions: 1
+  parallelism: 1
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        app: video-pipeline
+    spec:
+      restartPolicy: Never
+      runtimeClassName: nvidia
+      nodeSelector:
+        kubernetes.io/hostname: "{node_name}"
+      securityContext:
+        runAsUser: {RUN_UID}
+        runAsGroup: {RUN_GID}
+        fsGroup: {RUN_GID}
+      containers:
+      - name: worker
+        image: {image}
+        imagePullPolicy: IfNotPresent
+        command: ["bash", "-c"]
+        args:
+          - |
+{script}
+        env:
+        - name: NVIDIA_VISIBLE_DEVICES
+          value: "all"
+        - name: NVIDIA_DRIVER_CAPABILITIES
+          value: "compute,utility,video"
+        volumeMounts:
+        - name: project
+          mountPath: /project
+        - name: localin
+          mountPath: /data/input
+        - name: localout
+          mountPath: /data/output
+      volumes:
+      - name: project
+        hostPath:
+          path: /mnt/hd/Project/dataprocess
+          type: Directory
+      - name: localin
+        hostPath:
+          path: {LOCAL_ROOT}/input
+          type: DirectoryOrCreate
+      - name: localout
+        hostPath:
+          path: {LOCAL_ROOT}/output
+          type: DirectoryOrCreate
+"""
+
+
 def build_job_yaml(cfg, shard_total, nodes):
     """生成 Indexed Job：每个分片一个 Pod，用 JOB_COMPLETION_INDEX 决定处理哪一片。"""
     stamp = datetime.now(timezone.utc).strftime("%m%d%H%M%S")
@@ -305,17 +389,46 @@ spec:
 """
 
 
+def submit_local_jobs(cfg):
+    """就近模式：给每个可用节点下发一个绑定该节点的 Job，只处理本地数据。"""
+    info = get_nodes()
+    ready = [n for n in info["nodes"] if n["ready"] and n["schedulable"]]
+    if not ready:
+        return False, "没有可调度的节点"
+    kubectl("create", "namespace", NAMESPACE)
+    stamp = datetime.now(timezone.utc).strftime("%m%d%H%M%S")
+    total = len(ready)
+    created, failed = [], []
+    for idx, node in enumerate(ready):
+        name, yaml = build_local_job_yaml(cfg, idx, total, node["name"], stamp)
+        tmp = Path("/tmp") / f"{name}.yaml"
+        tmp.write_text(yaml, encoding="utf-8")
+        ok, out = kubectl("apply", "-f", str(tmp))
+        (created if ok else failed).append(node["name"] if ok else f"{node['name']}: {out}")
+    if not created:
+        return False, "全部失败: " + "; ".join(failed)
+    msg = f"已在 {len(created)} 个节点下发就近任务（{', '.join(created)}）"
+    if failed:
+        msg += f"；失败 {len(failed)} 个"
+    return True, msg
+
+
 def submit_job(cfg):
     """校验参数并提交任务。"""
+    ok_opt, opts_or_err = validate_options(cfg.get("options", "").strip())
+    if not ok_opt:
+        return False, opts_or_err
+    cfg = dict(cfg, options=opts_or_err)
+
+    # 就近模式不需要填路径，各节点固定读写自己的本地目录
+    if cfg.get("mode") == "local":
+        return submit_local_jobs(cfg)
+
     for k in ("input", "output"):
         if not cfg.get(k):
             return False, f"缺少参数: {k}"
         if not validate_path(cfg[k]):
             return False, f"{k} 路径非法（需为绝对路径且不含特殊字符）"
-    ok_opt, opts_or_err = validate_options(cfg.get("options", "").strip())
-    if not ok_opt:
-        return False, opts_or_err
-    cfg = dict(cfg, options=opts_or_err)
     info = get_nodes()
     ready = [n for n in info["nodes"] if n["ready"] and n["schedulable"]]
     if not ready:
