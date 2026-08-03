@@ -8,6 +8,8 @@
     python3 server.py [--port 8080]
 """
 
+import base64
+import hmac
 import json
 import os
 import re
@@ -26,6 +28,59 @@ JOB_PREFIX = "vsplit"
 # worker 容器以此身份运行，保证产出文件归宿主机普通用户所有
 RUN_UID = int(os.environ.get("PIPELINE_UID", "1000"))
 RUN_GID = int(os.environ.get("PIPELINE_GID", "1000"))
+
+# 访问认证：设置了 PIPELINE_USER/PIPELINE_PASS 才启用（暴露公网时必须设置）
+AUTH_USER = os.environ.get("PIPELINE_USER", "")
+AUTH_PASS = os.environ.get("PIPELINE_PASS", "")
+
+# 任务参数白名单。界面提交的参数会被拼进容器内执行的命令，
+# 因此只放行已知选项，并禁止任何 shell 元字符，防止命令注入。
+ALLOWED_FLAGS = {
+    "--encoder", "--cq", "--crf", "--preset", "--fps", "--copy",
+    "--jobs", "--threads", "--gpu", "--detector", "--aggressive",
+    "--threshold", "--min-scene-len", "--min-clip",
+    "--skip-head", "--skip-tail", "--motion-threshold", "--trim-window",
+    "--no-auto-trim", "--no-dedup", "--skip-existing", "--skip-processed",
+    "--match-by-name",
+}
+SAFE_VALUE = re.compile(r"^[A-Za-z0-9._%-]+$")
+SAFE_PATH = re.compile(r"^/[A-Za-z0-9._/-]*$")
+
+
+def validate_options(text):
+    """校验处理参数：只允许白名单选项，值不得含 shell 元字符。
+    返回 (是否合法, 规范化后的参数串 或 错误说明)。"""
+    if not text:
+        return True, ""
+    if re.search(r"[;&|`$><\n\r'\"\\]", text):
+        return False, "参数含有非法字符（shell 元字符）"
+    parts = text.split()
+    out = []
+    i = 0
+    while i < len(parts):
+        tok = parts[i]
+        if not tok.startswith("--"):
+            return False, f"无法识别的参数: {tok}"
+        if tok not in ALLOWED_FLAGS:
+            return False, f"不允许的参数: {tok}"
+        out.append(tok)
+        # 后面若跟着取值，一并校验
+        if i + 1 < len(parts) and not parts[i + 1].startswith("--"):
+            val = parts[i + 1]
+            if not SAFE_VALUE.match(val):
+                return False, f"参数 {tok} 的取值非法: {val}"
+            out.append(val)
+            i += 2
+        else:
+            i += 1
+    return True, " ".join(out)
+
+
+def validate_path(p):
+    """输出/输入路径必须是绝对路径且不含可越权字符。"""
+    if not p or not SAFE_PATH.match(p) or ".." in p:
+        return False
+    return True
 # 各节点的处理能力权重（按 CPU 核数），用于分片时按算力分配
 CACHE_TTL = 5.0
 
@@ -255,6 +310,12 @@ def submit_job(cfg):
     for k in ("input", "output"):
         if not cfg.get(k):
             return False, f"缺少参数: {k}"
+        if not validate_path(cfg[k]):
+            return False, f"{k} 路径非法（需为绝对路径且不含特殊字符）"
+    ok_opt, opts_or_err = validate_options(cfg.get("options", "").strip())
+    if not ok_opt:
+        return False, opts_or_err
+    cfg = dict(cfg, options=opts_or_err)
     info = get_nodes()
     ready = [n for n in info["nodes"] if n["ready"] and n["schedulable"]]
     if not ready:
@@ -306,6 +367,28 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass  # 静默访问日志
 
+    def authorized(self):
+        """未配置账号密码时不启用认证；配置了则要求 HTTP Basic。"""
+        if not AUTH_USER:
+            return True
+        hdr = self.headers.get("Authorization", "")
+        if not hdr.startswith("Basic "):
+            return False
+        try:
+            raw = base64.b64decode(hdr[6:]).decode("utf-8")
+            user, _, pwd = raw.partition(":")
+        except (ValueError, UnicodeDecodeError):
+            return False
+        # 用固定时间比较，避免通过响应时间猜测密码
+        return (hmac.compare_digest(user, AUTH_USER)
+                and hmac.compare_digest(pwd, AUTH_PASS))
+
+    def require_auth(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Video Cluster"')
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def _send(self, code, body, ctype="application/json; charset=utf-8"):
         data = body.encode("utf-8") if isinstance(body, str) else body
         self.send_response(code)
@@ -315,6 +398,8 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        if not self.authorized():
+            return self.require_auth()
         u = urlparse(self.path)
         q = parse_qs(u.query)
         if u.path in ("/", "/index.html"):
@@ -335,6 +420,8 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, json.dumps({"error": "not found"}))
 
     def do_POST(self):
+        if not self.authorized():
+            return self.require_auth()
         u = urlparse(self.path)
         length = int(self.headers.get("Content-Length") or 0)
         try:
