@@ -24,21 +24,18 @@
 
 import argparse
 import hashlib
-import shlex
+import json
 import subprocess
 import sys
 from pathlib import Path
 
-# 集群节点：(名称, 内网 IP, SSH 端口)。各机 sshd 监听的是与端口号同名的非标准端口。
-NODES = [
-    ("10094", "192.168.1.218", 10094),
-    ("10095", "192.168.1.221", 10095),
-    ("10082", "192.168.1.206", 10082),
-    ("10052", "192.168.1.219", 10052),
-]
-SSH_USER = "ubuntu"
+# 节点清单来自 nodes.json，与 server.py 共用同一份，
+# 保证「数据分发到哪台」与「任务给哪台哪个分片号」严格一致
+_CFG = json.loads((Path(__file__).resolve().parent / "nodes.json").read_text(encoding="utf-8"))
+NODES = [(n["name"], n["ip"], n["ssh_port"]) for n in _CFG["nodes"]]
+SSH_USER = _CFG.get("ssh_user", "ubuntu")
 # 各节点本地数据根目录（不是 NFS，处理时零网络 IO）
-LOCAL_ROOT = "/mnt/hd/Project/local_data"
+LOCAL_ROOT = _CFG["local_root"]
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".flv", ".wmv", ".webm",
               ".m4v", ".mpg", ".mpeg", ".ts", ".m2ts", ".3gp", ".rmvb", ".rm", ".vob"}
 

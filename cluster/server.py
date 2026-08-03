@@ -45,8 +45,12 @@ ALLOWED_FLAGS = {
 }
 SAFE_VALUE = re.compile(r"^[A-Za-z0-9._%-]+$")
 SAFE_PATH = re.compile(r"^/[A-Za-z0-9._/-]*$")
-# 就近模式下各节点的本地数据根目录（需与 dispatch.py 保持一致）
-LOCAL_ROOT = "/mnt/hd/Project/local_data"
+
+# 就近模式的节点清单与 dispatch.py 共用 nodes.json：
+# 分片号就是节点在该列表中的位置，两边必须一致，否则数据与任务会错位
+_NODE_CFG = json.loads((HERE / "nodes.json").read_text(encoding="utf-8"))
+LOCAL_ROOT = _NODE_CFG["local_root"]
+LOCAL_NODES = [n["k8s_name"] for n in _NODE_CFG["nodes"]]
 
 
 def validate_options(text):
@@ -390,24 +394,32 @@ spec:
 
 
 def submit_local_jobs(cfg):
-    """就近模式：给每个可用节点下发一个绑定该节点的 Job，只处理本地数据。"""
+    """就近模式：给每个节点下发一个绑定该节点的 Job，只处理本地数据。
+
+    分片号严格取自 nodes.json 中的位置——数据是按同一顺序分发的，
+    这里若按别的顺序（比如 k8s 返回的节点排序）分配，就会出现
+    「素材在 A 机、A 机却去找别的分片」而一个都处理不到。
+    """
     info = get_nodes()
-    ready = [n for n in info["nodes"] if n["ready"] and n["schedulable"]]
-    if not ready:
-        return False, "没有可调度的节点"
+    alive = {n["name"] for n in info["nodes"] if n["ready"] and n["schedulable"]}
+    total = len(LOCAL_NODES)
     kubectl("create", "namespace", NAMESPACE)
     stamp = datetime.now(timezone.utc).strftime("%m%d%H%M%S")
-    total = len(ready)
-    created, failed = [], []
-    for idx, node in enumerate(ready):
-        name, yaml = build_local_job_yaml(cfg, idx, total, node["name"], stamp)
+    created, failed, skipped = [], [], []
+    for idx, k8s_name in enumerate(LOCAL_NODES):
+        if k8s_name not in alive:
+            skipped.append(k8s_name)
+            continue
+        name, yaml = build_local_job_yaml(cfg, idx, total, k8s_name, stamp)
         tmp = Path("/tmp") / f"{name}.yaml"
         tmp.write_text(yaml, encoding="utf-8")
         ok, out = kubectl("apply", "-f", str(tmp))
-        (created if ok else failed).append(node["name"] if ok else f"{node['name']}: {out}")
+        (created if ok else failed).append(k8s_name if ok else f"{k8s_name}: {out}")
     if not created:
-        return False, "全部失败: " + "; ".join(failed)
+        return False, "全部失败: " + "; ".join(failed or skipped)
     msg = f"已在 {len(created)} 个节点下发就近任务（{', '.join(created)}）"
+    if skipped:
+        msg += f"；跳过不可用节点 {', '.join(skipped)}（其分片数据本轮不会处理）"
     if failed:
         msg += f"；失败 {len(failed)} 个"
     return True, msg

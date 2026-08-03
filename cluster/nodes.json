@@ -1,0 +1,11 @@
+{
+  "_comment": "集群节点的权威清单。分片号 = 本列表中的位置，dispatch.py 与 server.py 必须共用此文件，否则数据分发到的节点与任务分配的分片号会对不上。新增节点追加到末尾会改变分片划分，需重新分发数据。",
+  "local_root": "/mnt/hd/Project/local_data",
+  "ssh_user": "ubuntu",
+  "nodes": [
+    {"name": "10094", "k8s_name": "10094",        "ip": "192.168.1.218", "ssh_port": 10094},
+    {"name": "10095", "k8s_name": "ubuntu-10095", "ip": "192.168.1.221", "ssh_port": 10095},
+    {"name": "10082", "k8s_name": "ubuntu-82",    "ip": "192.168.1.206", "ssh_port": 10082},
+    {"name": "10052", "k8s_name": "ubuntu-10052", "ip": "192.168.1.219", "ssh_port": 10052}
+  ]
+}
