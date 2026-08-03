@@ -79,6 +79,11 @@
   </section>
 
   <section>
+    <h2>存储</h2>
+    <div id="storagePanel"><div class="empty">加载中…</div></div>
+  </section>
+
+  <section>
     <h2>提交任务</h2>
     <div class="msg" id="msg"></div>
     <form onsubmit="submitJob(event)">
@@ -178,10 +183,67 @@ async function loadNodes() {
   }).join('');
 }
 
+function gb(b) {
+  if (!b && b !== 0) return '—';
+  if (b >= 1024 ** 4) return (b / 1024 ** 4).toFixed(2) + ' TB';
+  if (b >= 1024 ** 3) return (b / 1024 ** 3).toFixed(1) + ' GB';
+  if (b >= 1024 ** 2) return (b / 1024 ** 2).toFixed(0) + ' MB';
+  return (b / 1024).toFixed(0) + ' KB';
+}
+
+function barColor(p) {
+  return p >= 95 ? 'var(--bad)' : p >= 85 ? 'var(--warn)' : 'var(--ok)';
+}
+
 async function loadStorage() {
   const s = await api('/api/storage');
+  const sm = s.summary || {};
+  const usedPct = sm.total ? Math.round(100 * (sm.total - sm.free) / sm.total) : 0;
+
   document.getElementById('storage').textContent =
-    s.error ? '' : `· 共享存储 ${s.free_gb}GB 可用 / ${s.total_gb}GB`;
+    `· 集群可用 ${gb(sm.free)} / ${gb(sm.total)}`;
+
+  const rows = (s.nodes || []).map(n => {
+    if (n.error) {
+      return `<tr><td><b>${n.name}</b></td><td colspan="6" style="color:var(--bad)">
+        连接失败：${n.error}</td></tr>`;
+    }
+    const d = n.data_disk || {};
+    const p = d.total ? Math.round(100 * (d.total - d.free) / d.total) : 0;
+    const warn = d.free !== undefined && d.free < 100 * 1024 ** 3;
+    return `<tr>
+      <td><b>${n.name}</b><div style="font-size:11px;color:var(--dim)" class="mono">${n.ip}</div></td>
+      <td class="mono" style="font-size:11px">${d.mount || '—'}</td>
+      <td>${gb(d.total)}</td>
+      <td style="color:${warn ? 'var(--bad)' : 'inherit'}">${gb(d.free)}</td>
+      <td style="min-width:110px">
+        <div class="bar"><i style="width:${p}%;background:${barColor(p)}"></i></div>
+        <span style="font-size:11px;color:var(--dim)">${p}% 已用</span>
+      </td>
+      <td>${n.input_files} 个 / ${gb(n.input_bytes)}</td>
+      <td>${n.processed} 个 / ${gb(n.output_bytes)}</td>
+    </tr>`;
+  }).join('');
+
+  const sh = s.shared || {};
+  document.getElementById('storagePanel').innerHTML = `
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:12px">
+      <div class="card"><div class="kv"><span>集群总容量</span><b>${gb(sm.total)}</b></div>
+        <div class="bar"><i style="width:${usedPct}%;background:${barColor(usedPct)}"></i></div>
+        <div class="kv"><span>可用</span><b>${gb(sm.free)}</b></div></div>
+      <div class="card"><div class="kv"><span>待处理素材</span><b>${sm.input_files} 个</b></div>
+        <div class="kv"><span>占用</span><b>${gb(sm.input_bytes)}</b></div></div>
+      <div class="card"><div class="kv"><span>已处理</span><b>${sm.processed} 个</b></div>
+        <div class="kv"><span>产出占用</span><b>${gb(sm.output_bytes)}</b></div></div>
+      <div class="card"><div class="kv"><span>共享存储 (NFS)</span><b>${gb(sh.total)}</b></div>
+        <div class="bar"><i style="width:${sh.pct || 0}%;background:${barColor(sh.pct || 0)}"></i></div>
+        <div class="kv"><span>可用</span><b>${gb(sh.free)}</b></div></div>
+    </div>
+    <table>
+      <tr><th>节点</th><th>数据盘</th><th>容量</th><th>可用</th><th>使用率</th>
+          <th>本地素材</th><th>本地产出</th></tr>
+      ${rows}
+    </table>`;
 }
 
 async function loadJobs() {
@@ -262,6 +324,7 @@ function refreshAll() {
 toggleMode();
 refreshAll();
 setInterval(() => { loadNodes(); loadJobs(); }, 8000);
+setInterval(loadStorage, 25000);
 setInterval(() => { if (currentLog) showLogs(currentLog); }, 12000);
 </script>
 </body>

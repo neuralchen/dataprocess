@@ -476,16 +476,109 @@ def job_logs(name, tail=200):
     return out if ok else f"（暂无日志）{out}"
 
 
-def cluster_storage():
-    """共享存储用量。"""
-    path = "/mnt/hd/Project/cluster_data"
+def node_storage(node):
+    """查询单个节点的磁盘与本地数据用量。"""
+    ip, port = node["ip"], node["ssh_port"]
+    # 一次 SSH 取回全部信息，减少往返
+    script = (
+        f"df -B1 --output=source,target,size,avail,pcent -x tmpfs -x devtmpfs "
+        f"-x squashfs -x overlay 2>/dev/null | tail -n +2 | grep -vE 'efi|efivars|snap'; "
+        f"echo '---'; "
+        f"du -sb {LOCAL_ROOT}/input 2>/dev/null | cut -f1; "
+        f"du -sb {LOCAL_ROOT}/output 2>/dev/null | cut -f1; "
+        f"find {LOCAL_ROOT}/input -type f 2>/dev/null | wc -l; "
+        f"find {LOCAL_ROOT}/output -name scene.json 2>/dev/null | wc -l"
+    )
+    if ip in (_local_ips()):
+        ok, out = run_local(script)
+    else:
+        ok, out = run_local(
+            "ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "
+            f"-p {port} {_NODE_CFG.get('ssh_user','ubuntu')}@{ip} " + shlex_quote(script))
+    if not ok:
+        return {"name": node["name"], "error": out[:120]}
+
+    disks, tail = [], []
+    seen_head = False
+    for line in out.splitlines():
+        if line.strip() == "---":
+            seen_head = True
+            continue
+        if seen_head:
+            tail.append(line.strip())
+        else:
+            f = line.split()
+            if len(f) >= 5 and f[2].isdigit():
+                disks.append({"source": f[0], "mount": f[1],
+                              "total": int(f[2]), "free": int(f[3]), "pct": f[4]})
+    def pick(i):
+        try:
+            return int(tail[i])
+        except (IndexError, ValueError):
+            return 0
+    # 本地数据所在的那块盘（决定还能放多少素材）
+    data_disk = None
+    for d in sorted(disks, key=lambda x: -len(x["mount"])):
+        if LOCAL_ROOT.startswith(d["mount"]) and "nfs" not in d["source"]:
+            data_disk = d
+            break
+    return {
+        "name": node["name"], "k8s_name": node["k8s_name"], "ip": ip,
+        "disks": [d for d in disks if "nfs" not in d["source"]],
+        "data_disk": data_disk,
+        "input_bytes": pick(0), "output_bytes": pick(1),
+        "input_files": pick(2), "processed": pick(3),
+    }
+
+
+def _local_ips():
+    ok, out = run_local("hostname -I")
+    return set(out.split()) if ok else set()
+
+
+def run_local(cmd, timeout=40):
     try:
-        u = shutil.disk_usage(path)
-        return {"path": path, "total_gb": round(u.total / 1024**3),
-                "free_gb": round(u.free / 1024**3),
-                "used_pct": round(100 * u.used / u.total)}
-    except OSError as e:
-        return {"path": path, "error": str(e)}
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True,
+                           text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout or r.stderr or "").strip()
+    except (OSError, subprocess.SubprocessError) as e:
+        return False, str(e)
+
+
+def shlex_quote(s):
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def cluster_storage():
+    """集群存储总览：每个节点的可用空间、本地数据量，以及全局汇总。"""
+    nodes = [node_storage(n) for n in _NODE_CFG["nodes"]]
+    total = free = in_b = out_b = 0
+    in_f = done = 0
+    for n in nodes:
+        if n.get("error"):
+            continue
+        d = n.get("data_disk")
+        if d:
+            total += d["total"]
+            free += d["free"]
+        in_b += n["input_bytes"]
+        out_b += n["output_bytes"]
+        in_f += n["input_files"]
+        done += n["processed"]
+    shared = {}
+    try:
+        u = shutil.disk_usage("/mnt/hd/Project/cluster_data")
+        shared = {"total": u.total, "free": u.free,
+                  "pct": round(100 * u.used / u.total)}
+    except OSError:
+        pass
+    return {
+        "nodes": nodes,
+        "summary": {"total": total, "free": free,
+                    "input_bytes": in_b, "output_bytes": out_b,
+                    "input_files": in_f, "processed": done},
+        "shared": shared,
+    }
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -537,7 +630,9 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, json.dumps(cached("jobs", get_jobs, 3),
                                               ensure_ascii=False))
         if u.path == "/api/storage":
-            return self._send(200, json.dumps(cluster_storage(), ensure_ascii=False))
+            # 查存储要 SSH 到各节点，缓存久一点
+            return self._send(200, json.dumps(cached("storage", cluster_storage, 20),
+                                              ensure_ascii=False))
         if u.path == "/api/logs":
             name = (q.get("job") or [""])[0]
             return self._send(200, json.dumps({"logs": job_logs(name)},
