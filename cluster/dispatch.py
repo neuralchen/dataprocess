@@ -29,12 +29,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-# 集群节点：名称 -> (SSH 端口, 内网 IP)。SSH 从 master 直连内网地址。
+# 集群节点：(名称, 内网 IP, SSH 端口)。各机 sshd 监听的是与端口号同名的非标准端口。
 NODES = [
-    ("10094", "192.168.1.218"),
-    ("10095", "192.168.1.221"),
-    ("10082", "192.168.1.206"),
-    ("10052", "192.168.1.219"),
+    ("10094", "192.168.1.218", 10094),
+    ("10095", "192.168.1.221", 10095),
+    ("10082", "192.168.1.206", 10082),
+    ("10052", "192.168.1.219", 10052),
 ]
 SSH_USER = "ubuntu"
 # 各节点本地数据根目录（不是 NFS，处理时零网络 IO）
@@ -59,8 +59,9 @@ def run(cmd, capture=True, timeout=None):
         return False, str(e)
 
 
-def ssh(ip, remote_cmd, timeout=120):
-    return run(["ssh"] + SSH_OPTS + [f"{SSH_USER}@{ip}", remote_cmd], timeout=timeout)
+def ssh(ip, port, remote_cmd, timeout=120):
+    return run(["ssh"] + SSH_OPTS + ["-p", str(port), f"{SSH_USER}@{ip}", remote_cmd],
+               timeout=timeout)
 
 
 def is_local(ip):
@@ -69,10 +70,10 @@ def is_local(ip):
     return ok and ip in out.split()
 
 
-def node_exec(ip, cmd, timeout=120):
+def node_exec(ip, port, cmd, timeout=120):
     if is_local(ip):
         return run(["bash", "-c", cmd], timeout=timeout)
-    return ssh(ip, cmd, timeout=timeout)
+    return ssh(ip, port, cmd, timeout=timeout)
 
 
 def cmd_status(args):
@@ -80,7 +81,7 @@ def cmd_status(args):
     print(f"{'节点':<10} {'输入视频':>8} {'已处理':>8} {'产出片段':>9} "
           f"{'输入占用':>9} {'产出占用':>9} {'盘剩余':>8}")
     print("-" * 70)
-    for name, ip in NODES:
+    for name, ip, port in NODES:
         c = (f"IN={LOCAL_ROOT}/input; OUT={LOCAL_ROOT}/output; "
              f"echo $(find $IN -type f 2>/dev/null | wc -l) "
              f"$(find $OUT -name scene.json 2>/dev/null | wc -l) "
@@ -88,7 +89,7 @@ def cmd_status(args):
              f"$(du -sh $IN 2>/dev/null | cut -f1) "
              f"$(du -sh $OUT 2>/dev/null | cut -f1) "
              f"$(df -h {LOCAL_ROOT} 2>/dev/null | tail -1 | awk '{{print $4}}')")
-        ok, out = node_exec(ip, c)
+        ok, out = node_exec(ip, port, c)
         if not ok:
             print(f"{name:<10} {'连接失败':>8}  {out[:40]}")
             continue
@@ -120,19 +121,19 @@ def cmd_scatter(args):
         groups[shard_of(str(v.relative_to(src)), total)].append(v)
 
     print(f"素材 {len(vids)} 个，分为 {total} 片：")
-    for i, (name, _) in enumerate(NODES):
+    for i, (name, _, _p) in enumerate(NODES):
         size = sum(p.stat().st_size for p in groups[i]) / 1024**3
         print(f"  分片 {i} -> {name}: {len(groups[i]):>5} 个, {size:.1f} GB")
     if args.dry_run:
         print("\n（--dry-run，未实际传输）")
         return
 
-    for i, (name, ip) in enumerate(NODES):
+    for i, (name, ip, port) in enumerate(NODES):
         files = groups[i]
         if not files:
             continue
         print(f"\n=== 分发到 {name} ({len(files)} 个) ===")
-        node_exec(ip, f"mkdir -p {LOCAL_ROOT}/input {LOCAL_ROOT}/output")
+        node_exec(ip, port, f"mkdir -p {LOCAL_ROOT}/input {LOCAL_ROOT}/output")
         # 用 rsync 增量传输，--files-from 保持源目录结构
         listing = "\n".join(str(p.relative_to(src)) for p in files)
         lst = Path("/tmp") / f"scatter_{i}.txt"
@@ -142,7 +143,7 @@ def cmd_scatter(args):
         cmd = ["rsync", "-a", "--info=progress2", "--files-from", str(lst),
                str(src) + "/", dest]
         if not is_local(ip):
-            cmd[1:1] = ["-e", "ssh " + " ".join(SSH_OPTS)]
+            cmd[1:1] = ["-e", "ssh -p %d " % port + " ".join(SSH_OPTS)]
         ok, out = run(cmd, capture=False, timeout=None)
         print(f"  {'完成' if ok else '失败: ' + out[:200]}")
 
@@ -156,8 +157,8 @@ def cmd_gather(args):
         d.mkdir(parents=True, exist_ok=True)
         # 目标容量预检，避免拷到一半空间不足
         need = 0
-        for name, ip in NODES:
-            ok, out = node_exec(ip, f"du -sb {LOCAL_ROOT}/output 2>/dev/null | cut -f1")
+        for name, ip, port in NODES:
+            ok, out = node_exec(ip, port, f"du -sb {LOCAL_ROOT}/output 2>/dev/null | cut -f1")
             if ok and out.strip().isdigit():
                 need += int(out.strip())
         import shutil as _sh
@@ -167,9 +168,9 @@ def cmd_gather(args):
             sys.exit("目标空间不足，请更换目标或分批导出")
         dest = str(d)
 
-    for name, ip in NODES:
+    for name, ip, port in NODES:
         print(f"\n=== 从 {name} 收集 ===")
-        ok, cnt = node_exec(ip, f"find {LOCAL_ROOT}/output -name scene.json 2>/dev/null | wc -l")
+        ok, cnt = node_exec(ip, port, f"find {LOCAL_ROOT}/output -name scene.json 2>/dev/null | wc -l")
         if not ok:
             print(f"  跳过（连接失败）")
             continue
@@ -181,7 +182,7 @@ def cmd_gather(args):
                else f"{SSH_USER}@{ip}:{LOCAL_ROOT}/output/")
         cmd = ["rsync", "-a", "--info=progress2"]
         if not is_local(ip):
-            cmd += ["-e", "ssh " + " ".join(SSH_OPTS)]
+            cmd += ["-e", "ssh -p %d " % port + " ".join(SSH_OPTS)]
         if args.move:
             cmd.append("--remove-source-files")
         cmd += [src, dest if dest.endswith("/") else dest + "/"]
@@ -203,9 +204,9 @@ def cmd_clean(args):
     if not args.yes:
         if input("确认？(yes/N) ").strip().lower() != "yes":
             sys.exit("已取消")
-    for name, ip in NODES:
+    for name, ip, port in NODES:
         for t in targets:
-            ok, _ = node_exec(ip, f"rm -rf {LOCAL_ROOT}/{t}/* 2>/dev/null; echo done")
+            ok, _ = node_exec(ip, port, f"rm -rf {LOCAL_ROOT}/{t}/* 2>/dev/null; echo done")
             print(f"  {name} {t}: {'已清空' if ok else '失败'}")
 
 
