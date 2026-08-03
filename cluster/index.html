@@ -203,47 +203,71 @@ async function loadStorage() {
   document.getElementById('storage').textContent =
     `· 集群可用 ${gb(sm.free)} / ${gb(sm.total)}`;
 
-  const rows = (s.nodes || []).map(n => {
+  const ROLE = {
+    system: {t: '系统盘', c: 'var(--dim)'},
+    data:   {t: '数据盘', c: 'var(--accent)'},
+    unused: {t: '未使用', c: 'var(--warn)'},
+    idle:   {t: '未挂载', c: 'var(--warn)'},
+  };
+
+  const blocks = (s.nodes || []).map(n => {
     if (n.error) {
-      return `<tr><td><b>${n.name}</b></td><td colspan="6" style="color:var(--bad)">
-        连接失败：${n.error}</td></tr>`;
+      return `<div class="card"><div class="top"><span class="name">${n.name}</span>
+        <span class="badge b-bad">连接失败</span></div>
+        <div class="kv"><span>${n.error}</span></div></div>`;
     }
-    const d = n.data_disk || {};
-    const p = d.total ? Math.round(100 * (d.total - d.free) / d.total) : 0;
-    const warn = d.free !== undefined && d.free < 100 * 1024 ** 3;
-    return `<tr>
-      <td><b>${n.name}</b><div style="font-size:11px;color:var(--dim)" class="mono">${n.ip}</div></td>
-      <td class="mono" style="font-size:11px">${d.mount || '—'}</td>
-      <td>${gb(d.total)}</td>
-      <td style="color:${warn ? 'var(--bad)' : 'inherit'}">${gb(d.free)}</td>
-      <td style="min-width:110px">
-        <div class="bar"><i style="width:${p}%;background:${barColor(p)}"></i></div>
-        <span style="font-size:11px;color:var(--dim)">${p}% 已用</span>
-      </td>
-      <td>${n.input_files} 个 / ${gb(n.input_bytes)}</td>
-      <td>${n.processed} 个 / ${gb(n.output_bytes)}</td>
-    </tr>`;
+    const devs = (n.devices || []).map(d => {
+      const r = ROLE[d.role] || ROLE.data;
+      const has = d.mounted_total > 0;
+      const p = has ? Math.round(100 * (d.mounted_total - d.mounted_free) / d.mounted_total) : 0;
+      const isData = n.data_disk && n.data_disk.name === d.name;
+      return `<tr>
+        <td class="mono">${d.name}${isData ? ' <span class="badge b-master" style="font-size:10px">数据</span>' : ''}</td>
+        <td style="font-size:11px;color:var(--dim);max-width:180px">${d.model || '—'}</td>
+        <td>${gb(d.size)}</td>
+        <td><span style="color:${r.c};font-size:12px">${r.t}</span></td>
+        <td class="mono" style="font-size:11px;max-width:170px;word-break:break-all">${
+          d.mounts.length ? d.mounts.join('<br>') : (d.fstype || '无文件系统')}</td>
+        <td style="min-width:120px">${has ? `
+          <div class="bar"><i style="width:${p}%;background:${barColor(p)}"></i></div>
+          <span style="font-size:11px;color:var(--dim)">${gb(d.mounted_free)} 可用 / ${p}%</span>`
+          : `<span style="font-size:11px;color:var(--warn)">${gb(d.size)} 可回收</span>`}</td>
+      </tr>`;
+    }).join('');
+    const dd = n.data_disk || {};
+    const dp = dd.mounted_total ? Math.round(100 * (dd.mounted_total - dd.mounted_free) / dd.mounted_total) : 0;
+    return `<div class="card" style="margin-bottom:12px">
+      <div class="top">
+        <span class="name">${n.name} <span style="font-size:12px;color:var(--dim)" class="mono">${n.ip}</span></span>
+        <span style="font-size:12px;color:var(--dim)">
+          数据盘可用 <b style="color:${dd.mounted_free < 100*1024**3 ? 'var(--bad)' : 'var(--ok)'}">${gb(dd.mounted_free)}</b>
+          · 本地素材 ${n.input_files} 个 · 已处理 ${n.processed} 个
+        </span>
+      </div>
+      <table style="margin-top:6px">
+        <tr><th>设备</th><th>型号</th><th>容量</th><th>用途</th><th>挂载点 / 文件系统</th><th>使用情况</th></tr>
+        ${devs}
+      </table>
+    </div>`;
   }).join('');
 
   const sh = s.shared || {};
   document.getElementById('storagePanel').innerHTML = `
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(180px,1fr));margin-bottom:12px">
-      <div class="card"><div class="kv"><span>集群总容量</span><b>${gb(sm.total)}</b></div>
+    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(175px,1fr));margin-bottom:14px">
+      <div class="card"><div class="kv"><span>集群裸容量</span><b>${gb(sm.raw)}</b></div>
+        <div class="kv"><span>其中未使用</span><b style="color:${sm.unused ? 'var(--warn)' : 'inherit'}">${gb(sm.unused)}</b></div></div>
+      <div class="card"><div class="kv"><span>数据盘总量</span><b>${gb(sm.total)}</b></div>
         <div class="bar"><i style="width:${usedPct}%;background:${barColor(usedPct)}"></i></div>
         <div class="kv"><span>可用</span><b>${gb(sm.free)}</b></div></div>
       <div class="card"><div class="kv"><span>待处理素材</span><b>${sm.input_files} 个</b></div>
         <div class="kv"><span>占用</span><b>${gb(sm.input_bytes)}</b></div></div>
       <div class="card"><div class="kv"><span>已处理</span><b>${sm.processed} 个</b></div>
         <div class="kv"><span>产出占用</span><b>${gb(sm.output_bytes)}</b></div></div>
-      <div class="card"><div class="kv"><span>共享存储 (NFS)</span><b>${gb(sh.total)}</b></div>
+      <div class="card"><div class="kv"><span>共享存储 NFS</span><b>${gb(sh.total)}</b></div>
         <div class="bar"><i style="width:${sh.pct || 0}%;background:${barColor(sh.pct || 0)}"></i></div>
         <div class="kv"><span>可用</span><b>${gb(sh.free)}</b></div></div>
     </div>
-    <table>
-      <tr><th>节点</th><th>数据盘</th><th>容量</th><th>可用</th><th>使用率</th>
-          <th>本地素材</th><th>本地产出</th></tr>
-      ${rows}
-    </table>`;
+    ${blocks}`;
 }
 
 async function loadJobs() {

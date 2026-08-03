@@ -476,56 +476,102 @@ def job_logs(name, tail=200):
     return out if ok else f"（暂无日志）{out}"
 
 
+def classify_disk(mounts, fstypes):
+    """按挂载点判断这块盘的用途，未挂载且无文件系统的是可回收的闲置盘。"""
+    if any(m == "/" or m.startswith("/boot") for m in mounts):
+        return "system"
+    if not mounts and not any(fstypes):
+        return "unused"
+    if not mounts:
+        return "idle"      # 有文件系统但没挂载
+    return "data"
+
+
 def node_storage(node):
-    """查询单个节点的磁盘与本地数据用量。"""
+    """列出该节点的所有物理存储设备（含未挂载的），以及本地数据用量。"""
     ip, port = node["ip"], node["ssh_port"]
-    # 一次 SSH 取回全部信息，减少往返
+    # lsblk 出 JSON 枚举全部块设备；df 补充已挂载分区的剩余空间
     script = (
-        f"df -B1 --output=source,target,size,avail,pcent -x tmpfs -x devtmpfs "
-        f"-x squashfs -x overlay 2>/dev/null | tail -n +2 | grep -vE 'efi|efivars|snap'; "
-        f"echo '---'; "
+        "lsblk -b -J -o NAME,SIZE,TYPE,FSTYPE,MOUNTPOINT,MODEL 2>/dev/null; "
+        "echo '===DF==='; "
+        "df -B1 --output=target,size,avail 2>/dev/null | tail -n +2; "
+        "echo '===DU==='; "
         f"du -sb {LOCAL_ROOT}/input 2>/dev/null | cut -f1; "
         f"du -sb {LOCAL_ROOT}/output 2>/dev/null | cut -f1; "
         f"find {LOCAL_ROOT}/input -type f 2>/dev/null | wc -l; "
         f"find {LOCAL_ROOT}/output -name scene.json 2>/dev/null | wc -l"
     )
-    if ip in (_local_ips()):
-        ok, out = run_local(script)
+    if ip in _local_ips():
+        ok, out = run_local(script, timeout=60)
     else:
         ok, out = run_local(
             "ssh -o ConnectTimeout=10 -o BatchMode=yes -o StrictHostKeyChecking=accept-new "
-            f"-p {port} {_NODE_CFG.get('ssh_user','ubuntu')}@{ip} " + shlex_quote(script))
+            f"-p {port} {_NODE_CFG.get('ssh_user','ubuntu')}@{ip} " + shlex_quote(script),
+            timeout=60)
     if not ok:
         return {"name": node["name"], "error": out[:120]}
 
-    disks, tail = [], []
-    seen_head = False
-    for line in out.splitlines():
-        if line.strip() == "---":
-            seen_head = True
+    lsblk_txt, _, rest = out.partition("===DF===")
+    df_txt, _, du_txt = rest.partition("===DU===")
+
+    # 已挂载分区的容量表
+    avail = {}
+    for line in df_txt.strip().splitlines():
+        f = line.split()
+        if len(f) >= 3 and f[1].isdigit():
+            avail[f[0]] = {"total": int(f[1]), "free": int(f[2])}
+
+    devices = []
+    try:
+        tree = json.loads(lsblk_txt).get("blockdevices", [])
+    except ValueError:
+        tree = []
+    for d in tree:
+        if d.get("type") != "disk" or (d.get("name") or "").startswith(("loop", "ram")):
             continue
-        if seen_head:
-            tail.append(line.strip())
-        else:
-            f = line.split()
-            if len(f) >= 5 and f[2].isdigit():
-                disks.append({"source": f[0], "mount": f[1],
-                              "total": int(f[2]), "free": int(f[3]), "pct": f[4]})
+        mounts, fstypes, parts = [], [], []
+        if d.get("mountpoint"):
+            mounts.append(d["mountpoint"])
+        fstypes.append(d.get("fstype"))
+        for c in d.get("children") or []:
+            if c.get("mountpoint"):
+                mounts.append(c["mountpoint"])
+            fstypes.append(c.get("fstype"))
+            parts.append({"name": c.get("name"), "size": c.get("size") or 0,
+                          "fstype": c.get("fstype"), "mount": c.get("mountpoint")})
+        # 该盘上所有已挂载分区的容量汇总
+        total = free = 0
+        for m in mounts:
+            if m in avail:
+                total += avail[m]["total"]
+                free += avail[m]["free"]
+        devices.append({
+            "name": d.get("name"), "size": d.get("size") or 0,
+            "model": (d.get("model") or "").strip(),
+            "fstype": d.get("fstype"), "mounts": mounts, "parts": parts,
+            "mounted_total": total, "mounted_free": free,
+            "role": classify_disk(mounts, fstypes),
+        })
+    devices.sort(key=lambda x: -x["size"])
+
+    tail = [l.strip() for l in du_txt.strip().splitlines()]
+
     def pick(i):
         try:
             return int(tail[i])
         except (IndexError, ValueError):
             return 0
-    # 本地数据所在的那块盘（决定还能放多少素材）
+
+    # 本地数据落在哪块盘上（决定这台还能放多少素材）
     data_disk = None
-    for d in sorted(disks, key=lambda x: -len(x["mount"])):
-        if LOCAL_ROOT.startswith(d["mount"]) and "nfs" not in d["source"]:
-            data_disk = d
-            break
+    best = -1
+    for dev in devices:
+        for m in dev["mounts"]:
+            if LOCAL_ROOT.startswith(m) and len(m) > best:
+                best, data_disk = len(m), dev
     return {
         "name": node["name"], "k8s_name": node["k8s_name"], "ip": ip,
-        "disks": [d for d in disks if "nfs" not in d["source"]],
-        "data_disk": data_disk,
+        "devices": devices, "data_disk": data_disk,
         "input_bytes": pick(0), "output_bytes": pick(1),
         "input_files": pick(2), "processed": pick(3),
     }
@@ -554,13 +600,18 @@ def cluster_storage():
     nodes = [node_storage(n) for n in _NODE_CFG["nodes"]]
     total = free = in_b = out_b = 0
     in_f = done = 0
+    raw = unused = 0          # 裸容量、闲置未用容量
     for n in nodes:
         if n.get("error"):
             continue
         d = n.get("data_disk")
         if d:
-            total += d["total"]
-            free += d["free"]
+            total += d["mounted_total"]
+            free += d["mounted_free"]
+        for dev in n.get("devices", []):
+            raw += dev["size"]
+            if dev["role"] in ("unused", "idle"):
+                unused += dev["size"]
         in_b += n["input_bytes"]
         out_b += n["output_bytes"]
         in_f += n["input_files"]
@@ -574,7 +625,7 @@ def cluster_storage():
         pass
     return {
         "nodes": nodes,
-        "summary": {"total": total, "free": free,
+        "summary": {"total": total, "free": free, "raw": raw, "unused": unused,
                     "input_bytes": in_b, "output_bytes": out_b,
                     "input_files": in_f, "processed": done},
         "shared": shared,
