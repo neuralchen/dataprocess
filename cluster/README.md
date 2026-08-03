@@ -32,6 +32,47 @@ sudo systemctl restart cluster-ui    # 重启
 journalctl -u cluster-ui -f          # 看服务日志
 ```
 
+## 两种处理模式
+
+### 就近处理（推荐）
+
+素材按分片预先分发到各节点本地盘，节点只读写自己的本地目录，**处理全程零网络 IO**。
+只有导出时才集中收集。适合数据量大、网络是瓶颈的场景。
+
+```bash
+cd /mnt/hd/Project/dataprocess/cluster
+
+# 1. 查看各节点本地数据与容量
+python3 dispatch.py status
+
+# 2. 把素材按分片分发到各节点（先 --dry-run 看分配方案）
+python3 dispatch.py scatter /path/to/videos --dry-run
+python3 dispatch.py scatter /path/to/videos
+
+# 3. 在界面上选「就近处理」模式提交任务（不需要填路径）
+
+# 4. 处理完导出到 U 盘 / 外部存储 / 另一台服务器
+python3 dispatch.py gather /mnt/usb/export
+python3 dispatch.py gather user@host:/data/collected --remote
+python3 dispatch.py gather /mnt/usb/export --move    # 导出后删除节点上的副本
+
+# 5. 确认无误后回收空间
+python3 dispatch.py clean --input --output
+```
+
+**分片映射由 `nodes.json` 统一定义**，分片号就是节点在该文件中的位置。
+`dispatch.py`（分发数据）和 `server.py`（分配任务）共用这一份，两者必须一致——
+否则会出现"素材在 A 机、A 机却去找别的分片"而一个都处理不到。
+新增节点追加到列表末尾会改变整体划分，需要重新分发数据。
+
+各节点的本地数据根目录是 `/mnt/hd/Project/local_data/{input,output}`，
+容器内固定映射为 `/data/input` 和 `/data/output`。
+
+### 共享存储
+
+所有节点读写 master 的 NFS 目录，不需要预先分发，但处理时占用网络带宽。
+适合数据量小、或需要频繁改动输入的场景。
+
 ## 共享存储
 
 master 的 9.1T 大盘通过 NFS 导出，四台机器都以 **`/mnt/cluster_data`** 挂载，路径完全一致。
@@ -93,6 +134,20 @@ docker save video-pipeline:latest -o /mnt/cluster_data/video-pipeline.tar
 sudo k3s ctr images import /mnt/cluster_data/video-pipeline.tar        # master
 # 其它节点各执行一次同样的 import
 ```
+
+## 网络实测数据
+
+| 项目 | 实测值 |
+| --- | --- |
+| 节点间裸 TCP 带宽 | 913–944 Mbit/s（约 114–118 MB/s，千兆跑满） |
+| NFS 单节点读 / 写 | 105 MB/s / 68–99 MB/s |
+| **NFS 三节点并发读** | **每台 39.5 MB/s（合计 119 MB/s，被 master 网卡卡住）** |
+| **NFS 三节点并发写** | **每台 38.7 MB/s（合计 116 MB/s）** |
+| master 本地盘 | 写 159 MB/s / 读 331 MB/s |
+
+结论：**共享存储模式下，存储是瓶颈而非 CPU/GPU**。三节点并发时总吞吐被 master 的千兆网卡限死在
+119 MB/s，节点越多人均越少。这正是就近处理模式存在的理由——处理阶段完全不碰网络，
+读写走本地盘（331 MB/s），只在导出时集中传输一次。
 
 ## 运维要点
 
