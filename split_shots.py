@@ -636,31 +636,80 @@ def detect_shots(video_path: Path, threshold: float, min_scene_len_sec: float,
 
 
 NVENC_BUSY_MARKERS = ("OpenEncodeSessionEx", "incompatible client key", "No capable devices")
+# GPU 掉线/驱动故障的特征。这类错误重试无用，必须立刻降级到 CPU，
+# 否则会像 GPU 掉线那次一样一路失败下去，留下成千上万个 0 字节文件。
+GPU_DEAD_MARKERS = ("cuInit", "CUDA_ERROR", "Device creation failed",
+                    "No device available for decoder", "Device setup failed")
 
 
-def run_ffmpeg(build_cmd, args, log: Log, what: str) -> bool:
-    """执行 ffmpeg，NVENC 会话耗尽时重试，仍失败则降级到 CPU 编码。
+def output_is_valid(path: Path, min_bytes: int = 1024) -> bool:
+    """校验 ffmpeg 的产出确实是可用视频。
 
-    消费级显卡的 NVENC 并发会话上限是整机 8 路（多卡也不叠加），
-    并行度偏高时可能短暂超限。没有这层保护的话该片段会被静默丢弃。
+    ffmpeg 会先创建输出文件再初始化编解码器，一旦初始化失败就会留下 0 字节文件。
+    只看返回码不够——必须确认文件非空且含有效视频流。
+    """
+    try:
+        if not path.exists() or path.stat().st_size < min_bytes:
+            return False
+    except OSError:
+        return False
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)],
+        capture_output=True, text=True)
+    return probe.returncode == 0 and bool(probe.stdout.strip())
+
+
+def discard(path: Path):
+    """删除无效产出，避免垃圾文件堆积并被误当作已完成。"""
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def run_ffmpeg(build_cmd, args, log: Log, what: str, dst: Path = None) -> bool:
+    """执行 ffmpeg，失败时按原因重试或降级到 CPU，并校验产出确实可用。
+
+    三层保护：
+      1. NVENC 会话耗尽（消费级显卡整机上限 8 路）→ 退避重试
+      2. GPU 掉线/驱动故障 → 立刻降级 CPU，不做无谓重试
+      3. 无论成功与否都校验产出，空文件或损坏文件一律删除并判为失败
 
     build_cmd(force_cpu) 需返回对应编码方式的完整 ffmpeg 命令。
     """
-    for attempt in range(3):
-        result = subprocess.run(build_cmd(False), capture_output=True, text=True)
-        if result.returncode == 0:
+    def attempt(force_cpu):
+        r = subprocess.run(build_cmd(force_cpu), capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, r.stderr.strip()
+        if dst is not None and not output_is_valid(dst):
+            discard(dst)
+            return False, "ffmpeg 返回成功但产出为空或无法解析"
+        return True, ""
+
+    for i in range(3):
+        ok, err = attempt(False)
+        if ok:
             return True
-        err = result.stderr.strip()
+        if dst is not None:
+            discard(dst)          # 清掉失败留下的空文件
+        if any(m in err for m in GPU_DEAD_MARKERS):
+            log.add(f"    [降级] GPU 不可用，改用 CPU 编码: {what}")
+            break
         if not any(m in err for m in NVENC_BUSY_MARKERS):
             log.add(f"    [错误] ffmpeg {what} 失败\n{err}")
             return False
-        if attempt < 2:
-            time.sleep(5 * (attempt + 1))  # 等其它任务释放会话
-    log.add(f"    [降级] NVENC 会话不足，改用 CPU 编码: {what}")
-    fb = subprocess.run(build_cmd(True), capture_output=True, text=True)
-    if fb.returncode == 0:
+        if i < 2:
+            time.sleep(5 * (i + 1))   # 等其它任务释放会话
+    else:
+        log.add(f"    [降级] NVENC 会话不足，改用 CPU 编码: {what}")
+
+    ok, err = attempt(True)
+    if ok:
         return True
-    log.add(f"    [错误] ffmpeg {what} 降级后仍失败\n{fb.stderr.strip()}")
+    if dst is not None:
+        discard(dst)
+    log.add(f"    [错误] ffmpeg {what} 降级后仍失败\n{err}")
     return False
 
 
@@ -682,7 +731,7 @@ def cut_segment(src: Path, dst: Path, start: float, end: float, args, log: Log) 
                    ["-c:a", "aac", "-b:a", "192k"]
         return cmd + ["-avoid_negative_ts", "make_zero", str(dst)]
 
-    return run_ffmpeg(build, args, log, f"切割 {dst.name}")
+    return run_ffmpeg(build, args, log, f"切割 {dst.name}", dst)
 
 
 def convert_full(src: Path, dst: Path, args, log: Log) -> bool:
@@ -699,7 +748,7 @@ def convert_full(src: Path, dst: Path, args, log: Log) -> bool:
                    ["-c:a", "aac", "-b:a", "192k"]
         return cmd + [str(dst)]
 
-    return run_ffmpeg(build, args, log, f"转码 {dst.name}")
+    return run_ffmpeg(build, args, log, f"转码 {dst.name}", dst)
 
 
 def process_video(video: Path, in_dir: Path, out_root: Path, args) -> str:
