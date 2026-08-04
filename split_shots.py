@@ -779,9 +779,12 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> str:
         dst = out_dir / f"{video.stem}_scene_0000{ext}"
         whole = [(0.0, duration)]
         if args.skip_existing and dst.exists():
-            log.add("  只有一个镜头，输出已存在，跳过")
-            write_scene_json(out_dir, video, whole, {0: dst}, args)
-            return log.text()
+            if output_is_valid(dst):
+                log.add("  只有一个镜头，输出已存在，跳过")
+                write_scene_json(out_dir, video, whole, {0: dst}, args)
+                return log.text()
+            log.add("  已存在的输出无效，删除后重做")
+            discard(dst)
         log.add("  只有一个镜头，整段转码输出")
         if convert_full(video, dst, args, log):
             log.add(f"  完成: 已保存到 {dst}")
@@ -825,10 +828,15 @@ def process_video(video: Path, in_dir: Path, out_root: Path, args) -> str:
     for n, idx in enumerate(kept_idx, 1):
         start, end = shots[idx]
         dst = out_dir / f"{video.stem}_scene_{idx:04d}{ext}"
+        # 断点续跑时也要校验已有文件——之前失败留下的空文件不能当成已完成，
+        # 否则会被记进 scene.json，成为再也不会被修复的坏样本
         if args.skip_existing and dst.exists():
-            outputs[idx] = dst
-            ok += 1
-            continue
+            if output_is_valid(dst):
+                outputs[idx] = dst
+                ok += 1
+                continue
+            log.add(f"    [重做] 已存在但无效，删除后重新处理: {dst.name}")
+            discard(dst)
         if cut_segment(video, dst, start, end, args, log):
             outputs[idx] = dst
             ok += 1
