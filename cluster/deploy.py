@@ -392,6 +392,132 @@ def resolve_ips(nodes):
         n.internal_ip = ip.strip() or n.host
 
 
+def ask(prompt, default=""):
+    tip = f"{prompt} [{default}]: " if default else f"{prompt}: "
+    v = input(tip).strip()
+    return v or default
+
+
+def probe_candidate(host, port, user, password, data_dir):
+    """连上去看看这台机器什么情况，顺便验证账号密码对不对。"""
+    cfg = {"name": host, "host": host, "ssh_port": port, "user": user,
+           "password": password, "data_dir": data_dir}
+    n = Node(cfg, {}, "?")
+    try:
+        info = n.probe()
+        _, ip = n.run("hostname -I | tr ' ' '\\n' | grep -E '^(192|10|172)' | head -1")
+        _, hn = n.run("hostname -s")
+        info["internal_ip"] = ip.strip()
+        info["hostname"] = hn.strip()
+        return info, None
+    except Exception as e:
+        return None, str(e)
+    finally:
+        n.close()
+
+
+def cmd_init(config_path):
+    """交互式向导：逐台录入节点，验证连通性，选定 master，生成 cluster.json。"""
+    print("集群配置向导\n")
+    print("提示：master 必须是 Linux 机器（k3s 控制平面不支持 Windows）。")
+    print("      本工具可以在 Windows 上运行，远程操控这些 Linux 节点。\n")
+
+    default_user = ask("默认登录账号", "ubuntu")
+    default_pass = ask("默认登录密码（各节点相同时只需填一次）", "")
+    default_dir = ask("默认数据盘路径（存放 k3s 数据与项目，别用根目录）", "/mnt/hd")
+
+    nodes = []
+    print("\n开始录入节点，直接回车结束录入。\n")
+    while True:
+        host = ask(f"第 {len(nodes)+1} 台的 IP 或主机名（回车结束）")
+        if not host:
+            break
+        port = int(ask("  SSH 端口", "22") or 22)
+        user = ask("  账号", default_user)
+        pwd = ask("  密码", default_pass)
+        ddir = ask("  数据盘路径", default_dir)
+        print("  连接中 ...", end="", flush=True)
+        info, err = probe_candidate(host, port, user, pwd, ddir)
+        if err:
+            print(f"\r  连接失败：{err[:80]}\n  请重新录入这一台\n")
+            continue
+        disk_ok = bool(info["disk"])
+        print(f"\r  ✓ {info['hostname']}  内网 {info['internal_ip']}")
+        print(f"    {info['os'][:36]} | {info['cpu']} 核 | {info['mem']} GB | "
+              f"GPU {info['gpu'][:40] or '无'}")
+        print(f"    数据盘 {ddir}: {info['disk'] or '不存在（部署会失败）'} | sudo {info['sudo']}")
+        if not disk_ok:
+            if ask("  数据盘路径无效，仍要加入吗？(y/N)", "N").lower() != "y":
+                print()
+                continue
+        nodes.append({"name": info["hostname"] or host, "host": host, "ssh_port": port,
+                      "user": user, "password": pwd, "data_dir": ddir, "_info": info})
+        print()
+
+    if not nodes:
+        sys.exit("没有录入任何节点")
+
+    print("已录入的节点：")
+    for i, n in enumerate(nodes, 1):
+        d = n["_info"]
+        free = (d["disk"] or "").split()[0] if d["disk"] else "?"
+        print(f"  {i}. {n['name']:<14} {d['internal_ip']:<15} "
+              f"{d['cpu']} 核 / {d['mem']} GB / 数据盘 {free} / "
+              f"GPU {len([x for x in (d['gpu'] or '').split(',') if x])} 张")
+
+    # 推荐磁盘余量最大的做 master——它要跑 NFS 服务端和镜像仓库
+    def free_bytes(n):
+        s = (n["_info"]["disk"] or "0").split()[0].rstrip("BKMGTP")
+        unit = (n["_info"]["disk"] or "0 ").split()[0][-1:]
+        try:
+            return float(s) * {"T": 1e12, "G": 1e9, "M": 1e6}.get(unit, 1)
+        except ValueError:
+            return 0
+    rec = max(range(len(nodes)), key=lambda i: free_bytes(nodes[i])) + 1
+    print(f"\nmaster 会承担控制平面、NFS 共享存储和管理界面，建议选磁盘余量最大的一台。")
+    pick = ask(f"选择 master（输入编号）", str(rec))
+    try:
+        mi = int(pick) - 1
+        assert 0 <= mi < len(nodes)
+    except (ValueError, AssertionError):
+        sys.exit("编号无效")
+
+    print()
+    ui_port = ask("管理界面端口", "8080")
+    ui_user = ask("界面登录账号（留空则不启用认证，暴露公网时务必设置）", "admin")
+    ui_pass = ask("界面登录密码", "") if ui_user else ""
+
+    for n in nodes:
+        n.pop("_info", None)
+    cfg = {
+        "master": nodes[mi],
+        "workers": [n for i, n in enumerate(nodes) if i != mi],
+        "options": {
+            "project_dir": "Project/dataprocess",
+            "repo": "https://github.com/neuralchen/dataprocess.git",
+            "shared_dir": "Project/cluster_data",
+            "local_data_dir": "Project/local_data",
+            "ui_port": int(ui_port or 8080),
+            "ui_user": ui_user,
+            "ui_password": ui_pass,
+            "k3s_version": "v1.36.2+k3s1",
+        },
+    }
+    p = Path(config_path)
+    if p.exists() and ask(f"{p.name} 已存在，覆盖？(y/N)", "N").lower() != "y":
+        sys.exit("已取消")
+    p.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        p.chmod(0o600)     # 里面有密码，收紧权限
+    except OSError:
+        pass
+    print(f"\n配置已保存到 {p}")
+    print(f"  master: {nodes[mi]['name']}")
+    print(f"  worker: {', '.join(n['name'] for i, n in enumerate(nodes) if i != mi) or '无'}")
+    print("\n接下来执行：python deploy.py deploy")
+    return 0
+
+
 def cmd_check(master, workers, opts):
     log("检查各节点环境（不做任何改动）\n")
     ok = True
@@ -504,9 +630,13 @@ def cmd_teardown(master, workers, opts):
 
 def main():
     ap = argparse.ArgumentParser(description="k3s 视频处理集群一键部署")
-    ap.add_argument("action", choices=["check", "deploy", "status", "teardown"])
+    ap.add_argument("action", choices=["init", "check", "deploy", "status", "teardown"],
+                    help="init=交互式生成配置并选定 master")
     ap.add_argument("-c", "--config", default=str(HERE / "cluster.json"))
     args = ap.parse_args()
+
+    if args.action == "init":
+        sys.exit(cmd_init(args.config))
 
     master, workers, opts = load_config(args.config)
     fn = {"check": cmd_check, "deploy": cmd_deploy,

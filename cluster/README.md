@@ -11,16 +11,51 @@
 **可以在 Windows / Linux / macOS 上运行**——它只是个 SSH 客户端。
 但 **master 必须是 Linux 机器**，k3s 的控制平面没有 Windows 版本。
 
+### 最简用法：跑启动脚本
+
+**Linux / macOS**
+
+```bash
+bash deploy.sh
+```
+
+**Windows**（双击 `deploy.bat`，或在 cmd 里执行）
+
+```bat
+deploy.bat
+```
+
+脚本会自动检查 Python、装好 `paramiko`，然后进入菜单：
+
+```
+=========== 集群部署 ===========
+  当前配置: master=10094, 共 4 个节点
+  1) 配置集群（录入节点、选定 master）
+  2) 检查各节点环境（只读，不做改动）
+  3) 执行部署
+  4) 查看集群状态
+  5) 卸载 k3s（保留数据）
+```
+
+选 **1** 进入配置向导：逐台输入 IP、SSH 端口、账号、密码、数据盘路径，
+每输入一台会**立即连上去验证**并显示系统、CPU、内存、GPU、磁盘余量和 sudo 权限，
+连不上会当场提示重填。全部录完后列出清单，**由你指定哪台做 master**
+（默认推荐磁盘余量最大的一台，因为 master 要承担 NFS 共享存储和镜像分发）。
+
+配置存在 `cluster.json`（含密码，权限自动设为 600）。之后选 **2** 检查、选 **3** 部署。
+
+### 命令行用法
+
 ```bash
 pip install paramiko
-cp cluster.example.json cluster.json     # Windows 用 copy
-# 编辑 cluster.json，填入各节点的 IP、SSH 端口、账号、密码、数据盘路径
-
+python deploy.py init        # 交互式配置并选定 master
 python deploy.py check       # 只检查环境，不做任何改动
 python deploy.py deploy      # 执行完整部署
 python deploy.py status      # 查看集群状态
 python deploy.py teardown    # 卸载 k3s（保留数据与项目）
 ```
+
+也可以跳过向导，直接复制 `cluster.example.json` 为 `cluster.json` 手工填写。
 
 `check` 会逐台报告系统版本、CPU、内存、GPU、ffmpeg/NVENC、docker、sudo 权限和数据盘余量，
 并对 sudo 不可用、数据盘路径不存在等会导致部署失败的问题给出 `!!` 标记。**建议先跑 check 再 deploy。**
