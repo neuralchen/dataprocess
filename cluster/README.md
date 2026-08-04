@@ -3,6 +3,35 @@
 把局域网内多台机器组成 k3s 集群，通过 master 上的 Web 界面统一管理节点、下发分布式视频处理任务，
 任务按分片自动调度到各节点并行执行。
 
+## 一键部署
+
+`deploy.py` 读取节点清单（IP、端口、账号、密码），通过 SSH 自动完成全部搭建：
+安装依赖与 k3s、组网、部署项目与运行环境、配置 NFS 共享存储、构建分发 worker 镜像、启动管理界面。
+
+**可以在 Windows / Linux / macOS 上运行**——它只是个 SSH 客户端。
+但 **master 必须是 Linux 机器**，k3s 的控制平面没有 Windows 版本。
+
+```bash
+pip install paramiko
+cp cluster.example.json cluster.json     # Windows 用 copy
+# 编辑 cluster.json，填入各节点的 IP、SSH 端口、账号、密码、数据盘路径
+
+python deploy.py check       # 只检查环境，不做任何改动
+python deploy.py deploy      # 执行完整部署
+python deploy.py status      # 查看集群状态
+python deploy.py teardown    # 卸载 k3s（保留数据与项目）
+```
+
+`check` 会逐台报告系统版本、CPU、内存、GPU、ffmpeg/NVENC、docker、sudo 权限和数据盘余量，
+并对 sudo 不可用、数据盘路径不存在等会导致部署失败的问题给出 `!!` 标记。**建议先跑 check 再 deploy。**
+
+部署过程是幂等的，中断后重跑会跳过已完成的步骤。`deploy` 结束时会自动生成
+`nodes.json`（分片映射表）并打印管理界面地址。
+
+几个容易踩的点已经在工具里处理了：`sudo` 会剥离环境变量，所以 k3s 安装用 `sudo env` 传参；
+k3s 数据目录通过 bind mount 落到大盘并写入 fstab，不占根分区；集群令牌走环境文件而非命令行，
+避免被同机其它用户看到。
+
 ## 集群构成
 
 | 角色 | SSH 端口 | 内网 IP | CPU | 内存 | GPU |

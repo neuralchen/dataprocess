@@ -1,0 +1,45 @@
+{
+  "_说明": "集群配置模板。复制为 cluster.json 后按实际情况修改，再运行 python deploy.py",
+
+  "_master说明": "master 必须是 Linux 机器（k3s 控制平面不支持 Windows）。部署工具本身可以在 Windows 上运行。",
+  "master": {
+    "name": "10094",
+    "host": "192.168.1.218",
+    "ssh_port": 22,
+    "user": "ubuntu",
+    "password": "改成你的密码",
+    "data_dir": "/mnt/hd"
+  },
+
+  "_workers说明": "worker 节点列表。data_dir 是该机上用于存放 k3s 数据和项目的大盘挂载点，不要用根目录。",
+  "workers": [
+    {
+      "name": "10095",
+      "host": "192.168.1.221",
+      "ssh_port": 22,
+      "user": "ubuntu",
+      "password": "改成你的密码",
+      "data_dir": "/mnt/hd"
+    },
+    {
+      "name": "10082",
+      "host": "192.168.1.206",
+      "ssh_port": 22,
+      "user": "ubuntu",
+      "password": "改成你的密码",
+      "data_dir": "/mnt/hd"
+    }
+  ],
+
+  "_options说明": "可选项。ui_port 是管理界面端口；ui_user/ui_password 为界面访问认证，留空则不启用认证（不建议暴露公网时留空）。",
+  "options": {
+    "project_dir": "Project/dataprocess",
+    "repo": "https://github.com/neuralchen/dataprocess.git",
+    "shared_dir": "Project/cluster_data",
+    "local_data_dir": "Project/local_data",
+    "ui_port": 8080,
+    "ui_user": "admin",
+    "ui_password": "改成一个强密码",
+    "k3s_version": "v1.36.2+k3s1"
+  }
+}
